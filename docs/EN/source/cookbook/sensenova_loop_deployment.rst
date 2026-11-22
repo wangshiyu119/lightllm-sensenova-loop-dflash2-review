@@ -95,3 +95,28 @@ Example Request
           "messages": [{"role": "user", "content": "Hello, introduce yourself in one sentence."}],
           "max_tokens": 128
         }'
+
+DFlash2 Speculative Decoding
+---------------------------
+
+DFlash2 generates candidate tokens with a draft model and verifies them with
+SenseNova-Loop. This example uses four GPUs, BF16 weights, FP32 SSM state, and a
+draft length of five:
+
+.. code-block:: bash
+
+    MODEL_DIR=/path/to/SenseNova-Loop-9B \
+    DRAFT_MODEL_DIR=/path/to/SenseNova-Loop-9B-DFlash2 \
+    CUDA_VISIBLE_DEVICES=0,1,2,3 \
+    bash test/start_scripts/sensenova_loop/sensenova_loop_dflash2.sh
+
+``MODEL_DIR`` and ``DRAFT_MODEL_DIR`` select compatible target and draft model
+directories. Set ``DRY_RUN=1`` to print the launch command, ``METHOD=target`` to
+disable drafting, or ``MTP_STEP=7`` to use a draft length of seven. ``PYTHON``
+selects the Python interpreter.
+
+The feature order, final-normalized feature selection, and projection width
+must match the draft checkpoint's training configuration. See
+:doc:`../references/draft_checkpoint_features` for ``target_feature_sources``.
+The launch script enables final acceptance metrics in normal mode; see
+:doc:`../references/speculative_acceptance_metrics` for the response schema.
