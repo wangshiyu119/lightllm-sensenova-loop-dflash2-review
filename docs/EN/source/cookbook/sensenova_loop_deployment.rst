@@ -100,8 +100,9 @@ DFlash2 Speculative Decoding
 ---------------------------
 
 DFlash2 generates candidate tokens with a draft model and verifies them with
-SenseNova-Loop. This example uses four GPUs, BF16 weights, FP32 SSM state, and a
-draft length of five:
+SenseNova-Loop. This example uses tensor parallelism across four GPUs,
+BF16 model loading, FP32 linear-attention state, and five draft tokens per
+verification round:
 
 .. code-block:: bash
 
@@ -112,11 +113,13 @@ draft length of five:
 
 ``MODEL_DIR`` and ``DRAFT_MODEL_DIR`` select compatible target and draft model
 directories. Set ``DRY_RUN=1`` to print the launch command, ``METHOD=target`` to
-disable drafting, or ``MTP_STEP=7`` to use a draft length of seven. ``PYTHON``
-selects the Python interpreter.
+disable drafting, or ``MTP_STEP=7`` to propose seven draft tokens per round.
+``PYTHON`` selects the Python interpreter.
 
-The feature order, final-normalized feature selection, and projection width
-must match the draft checkpoint's training configuration. See
+The selected target layers, inclusion of the final normalized hidden state,
+and projection input width must match the draft checkpoint's training
+configuration. See
 :doc:`../references/draft_checkpoint_features` for ``target_feature_sources``.
-The launch script enables final acceptance metrics in normal mode; see
+The launch script enables per-request acceptance statistics in ``normal``
+serving mode; see
 :doc:`../references/speculative_acceptance_metrics` for the response schema.

@@ -227,8 +227,7 @@ class LayerHiddenCollector(HiddenCollector):
 
     def add_final_hidden(self, final_hidden: torch.Tensor) -> None:
         if self.include_final_postnorm:
-            # BaseModel publishes the gathered pre-norm hidden. Apply the
-            # target's actual final normalization once when consuming it.
+            # Defer final normalization until feature assembly in finish_output.
             self.final_hidden = final_hidden
 
     def add(self, layer_index: int, hidden: torch.Tensor) -> None:

@@ -97,7 +97,8 @@ DFlash2 推测解码
 ----------------
 
 DFlash2 使用草稿模型并行生成候选 token，由 SenseNova-Loop 主模型验证。
-以下示例使用四张 GPU、BF16 权重、FP32 SSM 状态和长度为 5 的草稿块：
+以下示例使用四张 GPU 进行张量并行，以 BF16 加载模型、以 FP32 保存线性注意力状态，
+每轮提出 5 个草稿 token：
 
 .. code-block:: bash
 
@@ -108,8 +109,8 @@ DFlash2 使用草稿模型并行生成候选 token，由 SenseNova-Loop 主模�
 
 ``MODEL_DIR`` 和 ``DRAFT_MODEL_DIR`` 分别指定兼容的主模型与草稿模型目录。
 设置 ``DRY_RUN=1`` 可打印启动命令，``METHOD=target`` 可关闭草稿模型，
-``MTP_STEP=7`` 可将草稿长度改为 7。``PYTHON`` 用于指定 Python 解释器。
+``MTP_STEP=7`` 可设置为每轮提出 7 个草稿 token。``PYTHON`` 用于指定 Python 解释器。
 
 草稿配置中的特征层顺序、最终归一化特征和投影宽度须与训练配置一致。
 包含最终归一化特征时，使用 ``target_feature_sources`` 显式声明。
-该启动脚本在 normal 模式开启最终接受指标。
+该启动脚本在 ``normal`` 服务模式下返回每个请求的接受统计。

@@ -1,12 +1,13 @@
-"""Read the target features used by a draft checkpoint."""
+"""Parse the target feature configuration of a draft checkpoint."""
 
 
 def get_target_feature_sources(config: dict) -> tuple:
-    """Return intermediate layer IDs and an optional final normalized hidden state.
+    """Return ordered target feature identifiers and an optional final-state marker.
 
     Integer sources are zero-based execution-layer outputs. The optional
-    ``final_postnorm`` source follows all intermediate features. Legacy Loop
-    teacher exports store this list in ``loop_teacher.feature_sources``.
+    ``final_postnorm`` source follows all intermediate features. For backward
+    compatibility, older checkpoints may declare the list in
+    ``loop_teacher.feature_sources``.
     """
     config = config.get("text_config", config)
     layer_ids = config.get("target_layer_ids")

@@ -1,4 +1,4 @@
-"""Count accepted draft tokens for each request."""
+"""Collect speculative acceptance statistics for each request."""
 
 
 class SpecAcceptanceMetrics:
@@ -10,15 +10,14 @@ class SpecAcceptanceMetrics:
         self._bootstrap_next = True
 
     def mark_bootstrap(self):
-        """A recovered paused request prefills again before proposing a fresh block."""
+        """Record the next verification round as initialization after prefill."""
         self._bootstrap_next = True
 
     def record(self, accept_length: int, verify_width: int, output_end=None):
         if not 1 <= accept_length <= verify_width:
             raise ValueError("accept length must include one target token and fit the verification width")
-        # Prefill initializes target token slot 0 but does not propose a draft
-        # block. The first decode verifies this initialization. Subsequent
-        # blocks come from propose_next/scatter_mtp_next_tokens.
+        # The first decode after prefill verifies the target-generated token.
+        # Record it separately from subsequent draft proposals.
         bootstrap = self._bootstrap_next
         destination = self.bootstrap if bootstrap else self.proposals
         histogram = destination.setdefault(verify_width, [0] * verify_width)

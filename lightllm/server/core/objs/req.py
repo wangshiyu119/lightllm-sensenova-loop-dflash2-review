@@ -420,9 +420,8 @@ class Req(ctypes.Structure):
             metadata["spec_acceptance_metrics"] = meta["spec_acceptance_metrics"]
             final_counters = meta["spec_acceptance_metrics"].get("native_final_counters")
             if final_counters is not None:
-                # The HTTP metadata above may have been prepared before the
-                # final overlapping verification completed. Use the same
-                # release-time snapshot as the acceptance histogram.
+                # HTTP metadata can precede the last overlapping verification.
+                # Use the histogram snapshot and retain the earlier counters.
                 snapshot = {name: metadata.get(name) for name in final_counters}
                 if snapshot != final_counters:
                     metadata["spec_acceptance_metrics"]["http_counter_snapshot"] = snapshot

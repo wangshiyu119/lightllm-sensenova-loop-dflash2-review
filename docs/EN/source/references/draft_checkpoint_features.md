@@ -1,13 +1,13 @@
-# Target features for DFlash2
+# DFlash2 target features
 
-Drafters that use intermediate hidden states concatenate the execution-layer
-outputs listed in `target_layer_ids` (or `dflash_config.target_layer_ids`). Integer layer
-IDs refer to execution order, including repeated execution of shared Loop layers.
+DFlash2 concatenates the target hidden states selected by `target_layer_ids`
+(or `dflash_config.target_layer_ids`). Indices are zero-based and follow
+execution order, including repeated execution of shared Loop layers.
 
-## Final normalized target features
+## Final normalized hidden state
 
-A DFlash2 checkpoint trained with an additional final normalized target feature
-can declare it explicitly:
+Checkpoints trained with the target's final normalized hidden state declare
+it as the last entry in `target_feature_sources`:
 
 ```json
 {
@@ -16,11 +16,11 @@ can declare it explicitly:
 }
 ```
 
-The example concatenates five hidden states. With a target hidden size of 4096,
-`fc.weight` has shape `[4096, 20480]`. The collector normalizes the final hidden
-state with the target's final normalization weights, then appends it after the
-intermediate-layer outputs in execution order. A missing final hidden state or a
-feature order that does not match `target_layer_ids` raises an error.
+This configuration concatenates five hidden states. For a target hidden size
+of 4096, `fc.weight` has shape `[4096, 20480]`. The collector applies the target's
+final normalization to the final hidden state and appends it after the
+intermediate features. Missing final hidden states and inconsistent feature
+ordering raise errors.
 
-Older exports with the same list in `loop_teacher.feature_sources` are accepted.
-When both declarations are present they must agree.
+For backward compatibility, the same declaration is accepted in
+`loop_teacher.feature_sources`. If both fields are present, they must agree.
