@@ -1,8 +1,8 @@
 # Target features for DFlash2
 
-Intermediate-hidden drafters normally concatenate the execution-layer outputs
-listed in `target_layer_ids` (or `dflash_config.target_layer_ids`). Integer layer
-IDs refer to execution order, including repeated visits to shared Loop weights.
+Drafters that use intermediate hidden states concatenate the execution-layer
+outputs listed in `target_layer_ids` (or `dflash_config.target_layer_ids`). Integer layer
+IDs refer to execution order, including repeated execution of shared Loop layers.
 
 ## Final normalized target features
 
