@@ -1,0 +1,86 @@
+import random
+from typing import List
+from ..batch import Batch, Req
+from lightllm.server.router.req_queue.base_queue import BaseQueue
+from lightllm.server.router.req_queue.dp_balancer import get_dp_balancer
+from lightllm.utils.log_utils import init_logger
+
+logger = init_logger(__name__)
+
+
+class DpQueue:
+    def __init__(self, args, router, base_queue_class, dp_size_in_node) -> None:
+        self.dp_size_in_node = dp_size_in_node
+        self.base_queue_class = base_queue_class
+        from lightllm.server.router.manager import RouterManager
+
+        self.router: RouterManager = router
+        self.inner_queues: List[BaseQueue] = [
+            base_queue_class(args, router, dp_index, dp_size_in_node) for dp_index in range(self.dp_size_in_node)
+        ]
+        self.dp_balancer = get_dp_balancer(args, dp_size_in_node, self.inner_queues)
+        self.reqs_waiting_for_dp_index: List[List[Req]] = []
+        return
+
+    def release_aborted_req(self, req: Req):
+        dp_index = req.sample_params.suggested_dp_index
+        assert dp_index >= 0 and dp_index < self.dp_size_in_node
+        self.inner_queues[dp_index].release_aborted_req(req)
+        return
+
+    def get_dp_queue(self, dp_index: int):
+        assert dp_index < self.dp_size_in_node, "dp index out of range"
+        return self.inner_queues[dp_index]
+
+    def get_wait_req_num(self):
+        return sum(queue.get_wait_req_num() for queue in self.inner_queues)
+
+    # @calculate_time(show=True, min_cost_ms=10)
+    def generate_new_batch(self, current_batch: Batch):
+        self.dp_balancer.assign_reqs_to_dp(current_batch, self.reqs_waiting_for_dp_index)
+        batches = [
+            self.inner_queues[dp_index].generate_new_batch(current_batch) for dp_index in range(self.dp_size_in_node)
+        ]
+        return self._merge_batch(batches)
+
+    def _merge_batch(self, dp_batches: List[Batch]):
+        merged_batch: Batch = None
+        for iter_batch in dp_batches:
+            if merged_batch is not None:
+                merged_batch.merge(iter_batch)
+            else:
+                merged_batch = iter_batch
+        return merged_batch
+
+    def extend(self, req_group: List[Req]):
+        suggested_dp_index = req_group[0].sample_params.suggested_dp_index
+        if suggested_dp_index >= self.dp_size_in_node or suggested_dp_index < 0:
+            # 同一个组的，要分配在同一个 dp 上
+            if req_group[0].sample_params.high_priority_request:
+                # 高优先级请求组插在第一个普通请求组之前，同时保持高优先级组之间的 FIFO 顺序。
+                first_normal_group_index = len(self.reqs_waiting_for_dp_index)
+                for index, waiting_group in enumerate(self.reqs_waiting_for_dp_index):
+                    if not waiting_group[0].sample_params.high_priority_request:
+                        first_normal_group_index = index
+                        break
+                self.reqs_waiting_for_dp_index.insert(first_normal_group_index, req_group)
+            else:
+                self.reqs_waiting_for_dp_index.append(req_group)
+        else:
+            self.inner_queues[suggested_dp_index].extend(req_group)
+        return
+
+    def is_busy(self):
+        return True
+
+    def update_token_load(self, current_batch: Batch, force_update=False):
+        if self.router.shared_token_load.need_update_dynamic_max_load() or force_update:
+            for dp_index in range(self.dp_size_in_node):
+                estimated_peak_token_count, dynamic_max_load = self.inner_queues[dp_index].calcu_batch_token_load(
+                    current_batch
+                )
+                token_ratio1 = self.router.get_used_tokens(dp_index) / self.router.max_total_token_num
+                self.router.shared_token_load.set_current_load(token_ratio1, dp_index)
+                self.router.shared_token_load.set_estimated_peak_token_count(estimated_peak_token_count, dp_index)
+                self.router.shared_token_load.set_dynamic_max_load(dynamic_max_load, dp_index)
+        return

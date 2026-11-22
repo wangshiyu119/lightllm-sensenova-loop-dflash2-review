@@ -1,0 +1,388 @@
+import torch
+import triton
+from functools import partial
+from typing import Tuple
+from lightllm.models.qwen3_moe.layer_weights.transformer_layer_weight import Qwen3MOETransformerLayerWeight
+from lightllm.models.llama.layer_infer.transformer_layer_infer import LlamaTransformerLayerInfer
+from lightllm.models.llama.infer_struct import LlamaInferStateInfo
+from lightllm.models.llama.triton_kernel.rotary_emb import rotary_emb_fwd
+from lightllm.common.basemodel.triton_kernel.fused_moe.grouped_fused_moe_ep import (
+    use_sm100_mega_moe,
+)
+from lightllm.utils.dist_utils import get_global_world_size
+from lightllm.utils.envs_utils import get_env_start_args
+
+
+class Qwen3MOETransformerLayerInfer(LlamaTransformerLayerInfer):
+    def __init__(self, layer_num, network_config):
+        self.n_routed_experts = network_config.get("num_experts", 0)
+        self.is_moe = (
+            network_config.get("num_experts", 0) > 0
+            and layer_num not in network_config.get("mlp_only_layers", [])
+            and (layer_num + 1) % network_config.get("decoder_sparse_step", 1) == 0
+        )
+        self.num_experts_per_tok = network_config.get("num_experts_per_tok", 0)
+        self.norm_topk_prob = network_config.get("norm_topk_prob", True)
+        super().__init__(layer_num, network_config)
+        self.head_dim_ = network_config["head_dim"]
+        self.tp_k_head_num_ = max(self.tp_k_head_num_, 1)
+        self.tp_v_head_num_ = max(self.tp_v_head_num_, 1)
+        return
+
+    def _bind_func(self):
+        super()._bind_func()
+        self._bind_ffn()
+        return
+
+    def _bind_ffn(self):
+        if self.is_moe:
+            enable_ep_moe = get_env_start_args().enable_ep_moe
+            if enable_ep_moe:
+                self._ffn = self._ffn_ep_impl
+            else:
+                self._ffn = self._ffn_tp_impl
+        else:
+            self._ffn = partial(LlamaTransformerLayerInfer._ffn, self)
+
+    def _get_qkv(
+        self,
+        input: torch.Tensor,
+        infer_state: LlamaInferStateInfo,
+        layer_weight: Qwen3MOETransformerLayerWeight,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        input = input.view(-1, self.embed_dim_)
+        input = self._tpsp_allgather(input=input, infer_state=infer_state)
+
+        qkv = layer_weight.qkv_proj.mm(input)
+        q, cache_kv = qkv.split(
+            [self.tp_q_head_num_ * self.head_dim_, (self.tp_k_head_num_ + self.tp_v_head_num_) * self.head_dim_], dim=-1
+        )
+        layer_weight.qk_norm_weight_(
+            q,
+            cache_kv[:, : self.tp_k_head_num_ * self.head_dim_],
+            eps=self.eps_,
+        )
+        cache_kv = cache_kv.view(-1, (self.tp_k_head_num_ + self.tp_v_head_num_), self.head_dim_)
+        rotary_emb_fwd(
+            q.view(-1, self.tp_q_head_num_, self.head_dim_),
+            cache_kv[:, : self.tp_k_head_num_, :],
+            infer_state.position_cos,
+            infer_state.position_sin,
+        )
+        if infer_state.need_dp_prefill_balance:
+            q = infer_state._all_to_all_unbalance_get(data=q)
+            cache_kv = infer_state._all_to_all_unbalance_get(data=cache_kv)
+        return q, cache_kv
+
+    def _moe_ffn_tp(
+        self, input, infer_state: LlamaInferStateInfo, layer_weight: Qwen3MOETransformerLayerWeight
+    ) -> torch.Tensor:
+        hidden_states = input.view(-1, self.embed_dim_)
+        num_tokens, hidden_dim = hidden_states.shape
+        router_logits = layer_weight.moe_gate.mm(hidden_states)
+        layer_weight.experts.experts(
+            hidden_states,
+            router_logits=router_logits,
+            top_k=self.num_experts_per_tok,
+            renormalize=self.norm_topk_prob,
+            use_grouped_topk=False,
+            topk_group=None,
+            num_expert_group=None,
+            is_prefill=infer_state.is_prefill,
+            infer_state=infer_state,
+        )
+        return hidden_states.view(num_tokens, hidden_dim)
+
+    def _moe_ffn_edp(
+        self, input, infer_state: LlamaInferStateInfo, layer_weight: Qwen3MOETransformerLayerWeight
+    ) -> torch.Tensor:
+        hidden_states = input
+        token_num, hidden_dim = hidden_states.shape
+
+        router_logits = layer_weight.moe_gate.mm(hidden_states)
+        ep_output = layer_weight.experts.experts(
+            hidden_states,
+            router_logits=router_logits,
+            top_k=self.num_experts_per_tok,
+            renormalize=self.norm_topk_prob,
+            use_grouped_topk=False,
+            topk_group=None,
+            num_expert_group=None,
+            is_prefill=infer_state.is_prefill,
+            infer_state=infer_state,
+        )
+
+        ep_output = ep_output.view(token_num, hidden_dim)
+        return ep_output
+
+    def _ffn_tp_impl(
+        self, input, infer_state: LlamaInferStateInfo, layer_weight: Qwen3MOETransformerLayerWeight
+    ) -> torch.Tensor:
+        input = input.view(-1, self.embed_dim_)
+        input = self._tpsp_allgather(input=input, infer_state=infer_state)
+        ffn2_out = self._moe_ffn_tp(input=input, infer_state=infer_state, layer_weight=layer_weight)
+        ffn2_out = self._tpsp_reduce(input=ffn2_out, infer_state=infer_state)
+        return ffn2_out
+
+    def _ffn_ep_impl(
+        self, input, infer_state: LlamaInferStateInfo, layer_weight: Qwen3MOETransformerLayerWeight
+    ) -> torch.Tensor:
+        # ep 本身就是一种 sp 兼容，所以不需要再进行 allgather 和 reduce
+        input = input.view(-1, self.embed_dim_)
+        return self._moe_ffn_edp(input=input, infer_state=infer_state, layer_weight=layer_weight)
+
+    def overlap_tpsp_token_forward(
+        self,
+        input_embdings: torch.Tensor,
+        input_embdings1: torch.Tensor,
+        infer_state: LlamaInferStateInfo,
+        infer_state1: LlamaInferStateInfo,
+        layer_weight: Qwen3MOETransformerLayerWeight,
+    ):
+        if not self.is_moe or use_sm100_mega_moe(layer_weight.experts.quant_method):
+            return super().overlap_tpsp_token_forward(
+                input_embdings, input_embdings1, infer_state, infer_state1, layer_weight
+            )
+        # 0 attention
+        _0_input1 = self._att_norm(input_embdings, infer_state, layer_weight)
+        _0_q, _0_cache_kv = self._get_qkv(_0_input1, infer_state, layer_weight)
+        _0_input1 = None
+        self._post_cache_kv(_0_cache_kv, infer_state, layer_weight)
+        _0_o = self._token_attention_kernel(_0_q, infer_state, layer_weight)
+        _0_q = None
+        _0_o = self._get_o(_0_o, infer_state, layer_weight)
+        input_embdings.add_(_0_o.view(-1, self.embed_dim_))
+        _0_o = None
+        _0_input1 = self._ffn_norm(input_embdings, infer_state, layer_weight)
+        _0_router_logits = layer_weight.moe_gate.mm(_0_input1)
+        # 1 hook
+        if getattr(infer_state1, "hook", None) is not None:
+            infer_state1.hook()
+            infer_state1.hook = None
+
+        # 0 dispatch
+        _0_recv_x, _0_handle, _0_recv_topk_weights, _0_hook = layer_weight.experts.decode_dispatch(
+            _0_input1, _0_router_logits
+        )
+        del _0_input1, _0_router_logits
+        infer_state.hook = _0_hook
+
+        # 1 attention
+        _1_input1 = self._att_norm(input_embdings1, infer_state1, layer_weight)
+        _1_q, _1_cache_kv = self._get_qkv(_1_input1, infer_state1, layer_weight)
+        _1_input1 = None
+        self._post_cache_kv(_1_cache_kv, infer_state1, layer_weight)
+        _1_o = self._token_attention_kernel(_1_q, infer_state1, layer_weight)
+        _1_q = None
+        _1_o = self._get_o(_1_o, infer_state1, layer_weight)
+        input_embdings1.add_(_1_o.view(-1, self.embed_dim_))
+        _1_o = None
+        _1_input1 = self._ffn_norm(input_embdings1, infer_state1, layer_weight)
+        # to do gate and disptatch
+
+        _1_router_logits = layer_weight.moe_gate.mm(_1_input1)
+        # 0 hook
+        if getattr(infer_state, "hook", None) is not None:
+            infer_state.hook()
+            infer_state.hook = None
+
+        # 1 dispatch
+        _1_recv_x, _1_handle, _1_recv_topk_weights, _1_hook = layer_weight.experts.decode_dispatch(
+            _1_input1, _1_router_logits
+        )
+        del _1_input1, _1_router_logits
+        infer_state1.hook = _1_hook
+
+        # moe calu
+        expected_m = triton.cdiv(
+            input_embdings.shape[0] * get_global_world_size() * self.num_experts_per_tok, self.n_routed_experts
+        )
+        _0_moe_out = layer_weight.experts.decode_masked_group_gemm(
+            _0_recv_x, _0_handle, input_embdings.dtype, expected_m
+        )
+        del _0_recv_x
+
+        # 1 hook
+        if getattr(infer_state1, "hook", None) is not None:
+            infer_state1.hook()
+            infer_state1.hook = None
+
+        # 0 combine
+        _0_ffn_out, _0_hook = layer_weight.experts.decode_combine(_0_moe_out, _0_handle, _0_recv_topk_weights)
+        del _0_moe_out
+
+        infer_state.hook = _0_hook
+
+        # to do moe caclue
+        _1_moe_out = layer_weight.experts.decode_masked_group_gemm(
+            _1_recv_x, _1_handle, input_embdings1.dtype, expected_m
+        )
+        del _1_recv_x
+
+        # 0 hook
+        if getattr(infer_state, "hook", None) is not None:
+            infer_state.hook()
+            input_embdings.add_(_0_ffn_out.view(-1, self.embed_dim_))
+            del _0_ffn_out
+            infer_state.hook = None
+
+        # 1 combine
+        _1_ffn_out, _1_hook = layer_weight.experts.decode_combine(_1_moe_out, _1_handle, _1_recv_topk_weights)
+        del _1_moe_out
+
+        def _1_hook_post():
+            _1_hook()
+            nonlocal _1_ffn_out
+            input_embdings1.add_(_1_ffn_out.view(-1, self.embed_dim_))
+            return
+
+        infer_state1.hook = _1_hook_post
+
+        return input_embdings, input_embdings1
+
+    def overlap_tpsp_context_forward(
+        self,
+        input_embdings: torch.Tensor,
+        input_embdings1: torch.Tensor,
+        infer_state: LlamaInferStateInfo,
+        infer_state1: LlamaInferStateInfo,
+        layer_weight: Qwen3MOETransformerLayerWeight,
+    ):
+        if not self.is_moe or use_sm100_mega_moe(layer_weight.experts.quant_method):
+            return super().overlap_tpsp_context_forward(
+                input_embdings, input_embdings1, infer_state, infer_state1, layer_weight
+            )
+        # 0 attention
+        _0_input1 = self._att_norm(input_embdings, infer_state, layer_weight)
+        _0_q, _0_cache_kv = self._get_qkv(_0_input1, infer_state, layer_weight)
+        _0_input1 = None
+        self._post_cache_kv(_0_cache_kv, infer_state, layer_weight)
+        _0_o = self._context_attention_kernel(_0_q, _0_cache_kv, infer_state, layer_weight)
+        _0_q = None
+        _0_o = self._get_o(_0_o, infer_state, layer_weight)
+        input_embdings.add_(_0_o.view(-1, self.embed_dim_))
+        _0_o = None
+        _0_input1 = self._ffn_norm(input_embdings, infer_state, layer_weight)
+        _0_router_logits = layer_weight.moe_gate.mm(_0_input1)
+
+        # wait last 1 combine
+        if getattr(infer_state1, "hook", None) is not None:
+            infer_state1.hook()
+            infer_state1.hook = None
+
+        _0_topk_weight, _0_topk_idx, _0_qinput_tensor = layer_weight.experts.select_experts_and_quant_input(
+            _0_input1, _0_router_logits
+        )
+        del _0_router_logits, _0_input1
+        from deep_ep import ElasticBuffer
+
+        _0_overlap_event = ElasticBuffer.capture()
+
+        # 1 attention
+        _1_input1 = self._att_norm(input_embdings1, infer_state1, layer_weight)
+        _1_q, _1_cache_kv = self._get_qkv(_1_input1, infer_state1, layer_weight)
+        _1_input1 = None
+        self._post_cache_kv(_1_cache_kv, infer_state1, layer_weight)
+        _1_o = self._context_attention_kernel(_1_q, _1_cache_kv, infer_state1, layer_weight)
+        _1_q = None
+        _1_o = self._get_o(_1_o, infer_state1, layer_weight)
+        input_embdings1.add_(_1_o.view(-1, self.embed_dim_))
+        _1_o = None
+        _1_input1 = self._ffn_norm(input_embdings1, infer_state1, layer_weight)
+        # to do gate and disptatch
+
+        _1_router_logits = layer_weight.moe_gate.mm(_1_input1)
+
+        # 0 dispatch execute
+        (
+            _0_recv_x,
+            _0_recv_topk_idx,
+            _0_recv_topk_weight,
+            _0_num_recv_tokens_per_expert_list,
+            _0_handle,
+            _0_hook,
+        ) = layer_weight.experts.prefill_dispatch(
+            _0_qinput_tensor, _0_topk_idx, _0_topk_weight, overlap_event=_0_overlap_event
+        )
+        del _0_qinput_tensor, _0_topk_idx, _0_topk_weight
+        infer_state.hook = _0_hook
+
+        # wait 0 dispatch
+        if getattr(infer_state, "hook", None) is not None:
+            infer_state.hook()
+            infer_state.hook = None
+
+        _1_topk_weight, _1_topk_idx, _1_qinput_tensor = layer_weight.experts.select_experts_and_quant_input(
+            _1_input1, _1_router_logits
+        )
+        del _1_router_logits, _1_input1
+        _1_overlap_event = ElasticBuffer.capture()
+
+        # 0 moe calu
+        _0_moe_out = layer_weight.experts.prefilled_group_gemm(
+            _0_num_recv_tokens_per_expert_list,
+            _0_handle.num_unaligned_recv_tokens_per_expert,
+            _0_handle.recv_src_metadata,
+            _0_recv_x,
+            _0_recv_topk_idx,
+            _0_recv_topk_weight,
+        )
+        del _0_recv_x
+
+        # 1 dispatch execute
+        (
+            _1_recv_x,
+            _1_recv_topk_idx,
+            _1_recv_topk_weight,
+            _1_num_recv_tokens_per_expert_list,
+            _1_handle,
+            _1_hook,
+        ) = layer_weight.experts.prefill_dispatch(
+            _1_qinput_tensor, _1_topk_idx, _1_topk_weight, overlap_event=_1_overlap_event
+        )
+        del _1_qinput_tensor, _1_topk_idx, _1_topk_weight
+        infer_state1.hook = _1_hook
+
+        # wait 1 dispatch
+        if getattr(infer_state1, "hook", None) is not None:
+            infer_state1.hook()
+            infer_state1.hook = None
+
+        _0_combine_event = ElasticBuffer.capture()
+        # 0 combine execute
+        _0_ffn_out, _0_hook = layer_weight.experts.prefill_combine(_0_moe_out, _0_handle, _0_combine_event)
+        del _0_moe_out
+        infer_state.hook = _0_hook
+
+        # 1 moe calc
+        _1_moe_out = layer_weight.experts.prefilled_group_gemm(
+            _1_num_recv_tokens_per_expert_list,
+            _1_handle.num_unaligned_recv_tokens_per_expert,
+            _1_handle.recv_src_metadata,
+            _1_recv_x,
+            _1_recv_topk_idx,
+            _1_recv_topk_weight,
+        )
+        del _1_recv_x
+
+        # wait 0 combine
+        if getattr(infer_state, "hook", None) is not None:
+            infer_state.hook()
+            infer_state.hook = None
+
+        _1_combine_event = ElasticBuffer.capture()
+
+        input_embdings.add_(_0_ffn_out.view(-1, self.embed_dim_))
+
+        # 1 combine execute
+        _1_ffn_out, _1_hook = layer_weight.experts.prefill_combine(_1_moe_out, _1_handle, _1_combine_event)
+
+        def _1_hook_post():
+            _1_hook()
+            nonlocal _1_ffn_out
+            input_embdings1.add_(_1_ffn_out.view(-1, self.embed_dim_))
+            return
+
+        infer_state1.hook = _1_hook_post
+
+        return input_embdings, input_embdings1

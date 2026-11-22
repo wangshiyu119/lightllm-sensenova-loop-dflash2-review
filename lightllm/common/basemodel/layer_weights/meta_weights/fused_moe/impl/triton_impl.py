@@ -1,0 +1,103 @@
+import torch
+from typing import Optional
+from lightllm.common.quantization.no_quant import WeightPack
+from .base_impl import FuseMoeBaseImpl
+
+
+class FuseMoeTriton(FuseMoeBaseImpl):
+    def _select_experts(
+        self,
+        input_tensor: torch.Tensor,
+        router_logits: torch.Tensor,
+        correction_bias: Optional[torch.Tensor],
+        top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool,
+        topk_group: int,
+        num_expert_group: int,
+        scoring_func: str,
+        per_expert_scale: Optional[torch.Tensor] = None,
+    ):
+        """Select logical experts and return their weights and ids."""
+        from lightllm.common.basemodel.triton_kernel.fused_moe.topk_select import select_experts
+
+        topk_weights, topk_ids = select_experts(
+            hidden_states=input_tensor,
+            router_logits=router_logits,
+            correction_bias=correction_bias,
+            use_grouped_topk=use_grouped_topk,
+            top_k=top_k,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            scoring_func=scoring_func,
+        )
+        if self.routed_scaling_factor != 1.0:
+            topk_weights.mul_(self.routed_scaling_factor)
+        if per_expert_scale is not None:
+            topk_weights = topk_weights * per_expert_scale[topk_ids.to(torch.long)].to(topk_weights.dtype)
+        return topk_weights, topk_ids
+
+    def _prepare_expert_execution(
+        self,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        is_prefill: bool,
+        shared_expert_gate: Optional[torch.Tensor] = None,
+    ):
+        """把逻辑路由结果转换成 kernel 使用的执行布局。
+
+        普通路径原样返回。融合 shared expert 时追加新的权重和 ID 行，不修改
+        传入的逻辑 ``topk_ids``。
+        """
+        assert is_prefill is not None, "is_prefill must be explicitly specified for fused MoE execution"
+        if self.num_fused_shared_experts > 0:
+            from lightllm.common.basemodel.triton_kernel.fused_moe.append_shared_expert_topk import (
+                append_fused_shared_experts,
+            )
+
+            topk_weights, topk_ids = append_fused_shared_experts(
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                shared_expert_start_id=self.n_routed_experts,
+                num_fused_shared_experts=self.num_fused_shared_experts,
+                shared_expert_gate=shared_expert_gate,
+            )
+        return topk_weights, topk_ids
+
+    def _fused_experts(
+        self,
+        input_tensor: torch.Tensor,
+        w13: WeightPack,
+        w2: WeightPack,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        is_prefill: bool,
+        router_logits: Optional[torch.Tensor] = None,
+        alpha: Optional[float] = None,
+        limit: Optional[float] = None,
+        clamp_up_add_one: bool = True,
+        shared_expert_func=None,
+    ):
+        assert shared_expert_func is None, "FuseMoeTriton does not support shared expert overlap"
+        w13_weight, w13_scale = w13.weight, w13.weight_scale
+        w2_weight, w2_scale = w2.weight, w2.weight_scale
+        use_fp8_w8a8 = w13_weight.dtype == torch.float8_e4m3fn
+
+        from lightllm.common.basemodel.triton_kernel.fused_moe.grouped_fused_moe import fused_experts
+
+        fused_experts(
+            hidden_states=input_tensor,
+            w1=w13_weight,
+            w2=w2_weight,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            inplace=True,
+            use_fp8_w8a8=use_fp8_w8a8,
+            w1_scale=w13_scale,
+            w2_scale=w2_scale,
+            alpha=alpha,
+            limit=limit,
+            clamp_up_add_one=clamp_up_add_one,
+        )
+        return input_tensor

@@ -1,0 +1,818 @@
+import multiprocessing as mp
+import os
+import uuid
+import subprocess
+import math
+from lightllm.utils.start_utils import configure_decode_open_file_limit, process_manager
+from .metrics.manager import start_metric_manager
+from .httpserver.req_id_generator_server import start_req_id_generator_server
+from .embed_cache.manager import start_cache_manager
+from lightllm.utils.log_utils import init_logger
+from lightllm.utils.envs_utils import (
+    get_env_start_args,
+    get_unique_server_name,
+    set_env_start_args,
+    set_unique_server_name,
+)
+from lightllm.utils.shm_port_args import get_shm_port_args
+from lightllm.utils.net_utils import validate_ports
+from .detokenization.manager import start_detokenization_process
+from .router.manager import start_router_process
+from lightllm.utils.multinode_utils import send_and_receive_node_ip
+from lightllm.utils.redis_utils import start_redis_service
+from lightllm.utils.shm_size_check import check_recommended_shm_size
+from lightllm.server.core.objs.start_args_type import StartArgs
+from lightllm.utils.config_utils import (
+    has_audio_module,
+    has_vision_module,
+    is_hybrid_att_model,
+    auto_set_max_req_total_len,
+    auto_set_page_size,
+    auto_set_cpu_cache_token_page_size,
+    auto_set_fused_shared_experts,
+    auto_set_response_parsers,
+    get_running_max_req_size_per_dp,
+    get_default_disable_chunked_mm_input,
+)
+from lightllm.utils.dist_check_utils import auto_configure_allreduce_flags_from_args
+
+logger = init_logger(__name__)
+
+
+def _set_envs_and_config(args: StartArgs):
+    mp.set_start_method("spawn", force=True)
+
+
+def _launch_subprocesses(args: StartArgs):
+    _validate_pd_features(args)
+    configure_decode_open_file_limit(args)
+    _set_envs_and_config(args)
+
+    if args.target_vocab_topk_sampling is not None:
+        # 在加载模型和启动子进程前拒绝该组合，避免候选裁剪使输出约束失效。
+        # 数值冲突与后续兼容方案见 LlamaPostLayerInfer._target_lm_head_and_gather。
+        assert args.output_constraint_mode == "none", (
+            "--target_vocab_topk_sampling cannot be combined with --output_constraint_mode xgrammar "
+            "Disable --target_vocab_topk_sampling when using output constraints."
+        )
+
+    if args.mtp_mode is not None:
+        assert (
+            not args.disable_cudagraph or args.run_mode == "prefill"
+        ), "--disable_cudagraph is only supported on Prefill nodes when --mtp_mode is enabled"
+
+    auto_set_max_req_total_len(args)
+    auto_set_fused_shared_experts(args)
+    set_unique_server_name(args)
+
+    if args.enable_mps:
+        from lightllm.utils.device_utils import enable_mps
+
+        enable_mps()
+
+    if args.run_mode not in ["normal", "prefill", "decode", "visual_only"]:
+        return
+
+    _auto_set_prefill_queue_strategy(args)
+    auto_set_page_size(args)
+
+    # 通过模型的参数判断是否是多模态模型，包含哪几种模态, 并设置是否启动相应得模块
+    if args.disable_vision is None:
+        if has_vision_module(args.model_dir):
+            args.disable_vision = False
+        else:
+            args.disable_vision = True
+    if args.disable_audio is None:
+        if has_audio_module(args.model_dir):
+            args.disable_audio = False
+        else:
+            args.disable_audio = True
+
+    # pd 分离模式下，不启动多模态的模块
+    if args.run_mode == "decode":
+        args.disable_audio = True
+        args.disable_vision = True
+
+    if args.disable_vision and args.disable_audio:
+        args.enable_multimodal = False
+    else:
+        args.enable_multimodal = True
+
+    if args.enable_cpu_cache:
+        # 生成一个用于创建cpu kv cache的共享内存id。
+        args.cpu_kv_cache_shm_id = uuid.uuid1().int % 123456789
+
+    if args.enable_multimodal:
+        args.multi_modal_cache_shm_id = uuid.uuid1().int % 123456789
+
+    # 调度参数的自动设置, 人工设置则听人工的
+    if args.router_token_ratio is None:
+        if args.run_mode in ["normal", "decode"]:
+            args.router_token_ratio = 0.85
+        else:
+            # PD 分离模式下，prefill 节点不开启高级调度
+            args.router_token_ratio = 0.0
+    # 部分模式还不能支持与高级动态调度算法协同，to do.
+    if args.diverse_mode:
+        assert args.router_token_ratio == 0.0
+        assert args.page_size == 1, "diverse mode only supports page_size == 1"
+
+    # performance_mode 参数处理
+    if args.performance_mode == "personal":
+        args.running_max_req_size = 6
+        args.batch_max_tokens = 2048
+        args.chunked_prefill_size = 1024
+        args.embed_cache_storage_size = 0.8
+        args.graph_max_batch_size = 6
+        logger.info(
+            f"performance_mode is personal, set running_max_req_size to 3,"
+            f"batch_max_tokens to 2048, chunked_prefill_size to 1024,"
+            f"graph_max_batch_size to 32"
+        )
+
+    if not args.disable_shm_warning:
+        check_recommended_shm_size(args)
+
+    assert args.zmq_mode in ["tcp://", "ipc:///tmp/"]
+
+    logger.info(f"use tgi api: {args.use_tgi_api}")
+
+    # 当使用config_server来初始化nccl时，nccl_host和config_server_host必须一致
+    if args.use_config_server_to_init_nccl:
+        assert args.config_server_host == args.nccl_host
+
+    assert (
+        args.mem_fraction > 0 and args.mem_fraction < 1
+    ), f"Invalid mem_fraction {args.mem_fraction}, The expected value is between 0 and 1."
+
+    if args.graph_max_len_in_batch == 0:
+        args.graph_max_len_in_batch = args.max_req_total_len
+
+    # mode setting check.
+    is_hybrid_model = is_hybrid_att_model(args.model_dir)
+    if is_hybrid_model:
+        # 混合注意力模型的状态缓存依赖动态缓存和分块预填充，与是否开启输出约束无关。
+        assert not args.disable_dynamic_prompt_cache, "hybrid attention models require dynamic prompt cache"
+        assert not args.disable_chunked_prefill, "hybrid attention models require chunked prefill"
+    if args.diverse_mode:
+        # diverse 按普通 KV 前缀插入缓存，尚不支持混合注意力模型的状态页和哈希边界。
+        assert not is_hybrid_model, "--diverse_mode does not support hybrid attention models"
+        assert not args.disable_dynamic_prompt_cache, "--diverse_mode requires dynamic prompt cache"
+        assert not args.disable_chunked_prefill, "--diverse_mode requires chunked prefill"
+    if args.use_reward_model:
+        assert args.disable_dynamic_prompt_cache is True, "need add --disable_dynamic_prompt_cache"
+        assert args.disable_chunked_prefill is True, "need add --disable_chunked_prefill"
+    # FP8 KV cache mode checks
+    if args.llm_kv_type in ["fp8kv_sph", "fp8kv_spt"]:
+        assert (
+            args.kv_quant_calibration_config_path is not None
+        ), "fp8kv inference mode requires --kv_quant_calibration_config_path. "
+
+    if args.enable_prefill_microbatch_overlap or args.enable_decode_microbatch_overlap:
+        args.enable_tpsp_mix_mode = True
+        if args.enable_ep_moe and "PYTORCH_ALLOC_CONF" not in os.environ:
+            # 在启动模型子进程前设置，使 CUDA allocator 第一次初始化时即可
+            # 使用 CUDA Graph 拓扑分析 record_stream 张量的真实依赖关系。在确认
+            # 前一张量已经完成所有跨流访问后，Graph 私有内存池可以更早复用它的
+            # 显存，避免 overlap 路径的临时张量在多层捕获过程中重复保留。
+            os.environ["PYTORCH_ALLOC_CONF"] = "graph_capture_record_stream_reuse:True"
+
+    if args.enable_prefill_decode_mixed:
+        assert args.run_mode == "normal", "--enable_prefill_decode_mixed only supports run_mode normal"
+
+    if args.enable_dp_prefill_balance:
+        assert args.enable_tpsp_mix_mode and args.dp > 1, "need set --enable_tpsp_mix_mode firstly and --dp > 1"
+
+    if args.enable_ep_moe:
+        allowed_ep_prefill_att_backends = {"auto", "fa3", "triton", "flashqla", "flashkda"}
+        for backend in args.llm_prefill_att_backend:
+            assert backend in allowed_ep_prefill_att_backends, (
+                "When --enable_ep_moe is enabled, --llm_prefill_att_backend must be one of "
+                f"{sorted(allowed_ep_prefill_att_backends)}; flashinfer is not supported."
+            )
+        allowed_ep_decode_att_backends = {"auto", "fa3", "triton"}
+        for backend in args.llm_decode_att_backend:
+            assert backend in allowed_ep_decode_att_backends, (
+                "When --enable_ep_moe is enabled, --llm_decode_att_backend must be one of "
+                f"{sorted(allowed_ep_decode_att_backends)}; flashinfer is not supported."
+            )
+
+    if args.page_size < 1:
+        raise ValueError(f"--page_size must be >= 1, got {args.page_size}")
+    if args.run_mode in ("prefill", "decode"):
+        assert args.pd_kv_page_size % args.page_size == 0, "--pd_kv_page_size must be divisible by --page_size"
+
+    if args.page_size > 1:
+        # hybrid radix cache 的共享边界按 linear_att_hash_page_size 划分。只有该
+        # 边界同时落在模型 KV 页面边界上，hold_kv_len 才能保持统一的分页语义。
+        if is_hybrid_model and args.linear_att_hash_page_size % args.page_size != 0:
+            raise ValueError(
+                "--linear_att_hash_page_size must be divisible by --page_size when paged KV cache is enabled"
+            )
+    # mtp params check
+    if args.mtp_mode is not None:
+        if args.mtp_draft_model_dir is None:
+            assert args.mtp_mode not in (
+                "eagle3",
+                "dspark",
+                "dflash",
+                "dflash2",
+            ), f"--mtp_draft_model_dir is required for {args.mtp_mode} mode"
+            args.mtp_draft_model_dir = [args.model_dir] * args.mtp_step
+        assert args.mtp_step > 0
+    else:
+        assert args.mtp_draft_model_dir is None
+        assert args.mtp_step == 0
+
+    # automatically set visual_dp based on visual_tp and the per-node world size.
+    # In visual proxy mode keep the caller-provided visual_dp / visual_tp.
+    node_world_size = args.tp // args.nnodes
+    if not args.visual_use_proxy_mode and args.visual_tp < node_world_size and node_world_size % args.visual_tp == 0:
+        args.visual_dp = node_world_size // args.visual_tp
+    if args.afs_image_embed_dir is not None:
+        os.makedirs(args.afs_image_embed_dir, mode=0o777, exist_ok=True)
+        os.chmod(args.afs_image_embed_dir, 0o777)
+
+    # 检查GPU数量是否足够
+    if args.visual_gpu_ids is None:
+        args.visual_gpu_ids = list(range(args.visual_dp * args.visual_tp))
+    total_required_gpus = args.visual_dp * args.visual_tp
+    if len(args.visual_gpu_ids) < total_required_gpus:
+        raise ValueError(
+            f"Not enough GPUs specified. You need at least {total_required_gpus}, but got {len(args.visual_gpu_ids)}."
+        )
+    else:
+        args.visual_gpu_ids = args.visual_gpu_ids[:total_required_gpus]
+
+    if args.visual_dp <= 0:
+        raise ValueError("visual_dp must be a positive integer.")
+
+    if args.visual_infer_batch_size is None:
+        args.visual_infer_batch_size = args.visual_dp
+
+    # 检查visual_infer_batch_size是否合理
+    if args.visual_infer_batch_size // args.visual_dp < 1 or args.visual_infer_batch_size % args.visual_dp != 0:
+        raise ValueError(
+            f"visual_infer_batch_size ({args.visual_infer_batch_size}) must be "
+            f"a positive integer multiple of visual_dp ({args.visual_dp})"
+        )
+
+    if not args.disable_audio:
+        if args.audio_tp != 1:
+            raise ValueError(
+                "audio_tp > 1 is not supported for the audio encoder yet; use --audio_dp for multi-GPU data parallel."
+            )
+        if args.audio_gpu_ids is None:
+            args.audio_gpu_ids = list(range(args.audio_dp * args.audio_tp))
+        total_audio_gpus = args.audio_dp * args.audio_tp
+        if len(args.audio_gpu_ids) < total_audio_gpus:
+            raise ValueError(
+                f"Not enough audio GPUs specified. Need at least {total_audio_gpus}, "
+                f"but got {len(args.audio_gpu_ids)}."
+            )
+        args.audio_gpu_ids = args.audio_gpu_ids[:total_audio_gpus]
+        if args.audio_dp <= 0:
+            raise ValueError("audio_dp must be a positive integer.")
+        if args.audio_infer_batch_size is None:
+            args.audio_infer_batch_size = args.audio_dp * 4
+        if args.audio_infer_batch_size < 1:
+            raise ValueError("audio_infer_batch_size must be >= 1.")
+        if args.audio_infer_batch_size // args.audio_dp < 1 or args.audio_infer_batch_size % args.audio_dp != 0:
+            raise ValueError(
+                f"audio_infer_batch_size ({args.audio_infer_batch_size}) must be "
+                f"a positive integer multiple of audio_dp ({args.audio_dp})."
+            )
+
+    if args.disable_chunked_prefill:
+        args.chunked_prefill_size = args.max_req_total_len
+        # 普通模式下
+        if args.batch_max_tokens is None:
+            args.batch_max_tokens = args.max_req_total_len
+        else:
+            assert args.batch_max_tokens >= args.max_req_total_len, (
+                f"batch_max_tokens must >= max_req_total_len, "
+                f"but got {args.batch_max_tokens}, {args.max_req_total_len}"
+            )
+    else:
+        # chunked 模式下
+        if args.batch_max_tokens is None:
+            args.batch_max_tokens = 16384 // args.dp
+        if args.chunked_prefill_size is None:
+            args.chunked_prefill_size = args.batch_max_tokens // 2
+        assert args.batch_max_tokens >= args.chunked_prefill_size, (
+            "chunked prefill mode, batch_max_tokens must >= chunked_prefill_size, "
+            f"but got {args.batch_max_tokens}, {args.chunked_prefill_size}"
+        )
+
+    if args.run_mode == "decode":
+        # Decode 节点的启动 warmup 仍会构造 batch_max_tokens 个 token 做一次
+        # prefill-style model forward。Decode 节点没有必要沿用较大的 prefill
+        # batch 上限，但需要覆盖每个本地 DP rank 请求的一个 target token
+        # 和 mtp_step 个 draft token。这里必须使用 per-DP 容量，否则
+        # DeepEP prefill buffer 会再次按全局请求数过度分配。
+        decode_request_capacity = get_running_max_req_size_per_dp(args)
+        decode_batch_max_tokens = int(decode_request_capacity) * (1 + int(args.mtp_step))
+        logger.info(
+            "Decode node overrides batch_max_tokens: configured=%s, running_max_req_size=%s, "
+            "request_capacity=%s, mtp_step=%s, decode_batch_max_tokens=%s",
+            args.batch_max_tokens,
+            args.running_max_req_size,
+            decode_request_capacity,
+            args.mtp_step,
+            decode_batch_max_tokens,
+        )
+        args.batch_max_tokens = decode_batch_max_tokens
+
+    args.disable_chunked_mm_input = args.disable_chunked_mm_input or get_default_disable_chunked_mm_input(
+        args.model_dir
+    )
+    if args.disable_chunked_mm_input and not args.disable_vision:
+        assert args.batch_max_tokens >= args.max_image_token_count, (
+            "--disable_chunked_mm_input requires batch_max_tokens >= max_image_token_count, "
+            f"but got {args.batch_max_tokens}, {args.max_image_token_count}. "
+            "Increase --batch_max_tokens or reduce --max_image_token_count."
+        )
+
+    # hybrid checkpoint 参数自动设置；保留现有 linear_att_* 启动参数名。
+    if args.linear_att_cache_size is None:
+        # 小页池大小只对 hybrid 模型生效。
+        default_cache_size = args.running_max_req_size * 2
+        dp_size_in_node = max(1, args.dp // args.nnodes)
+        per_dp_cache_size = max(1, math.ceil(args.running_max_req_size / dp_size_in_node) * 2)
+        args.linear_att_cache_size = min(default_cache_size, per_dp_cache_size)
+
+    if args.run_mode == "decode":
+        # PD Decode 节点只接收 prompt 末尾位置的 hybrid checkpoint，不具备
+        # 中间大页边界对应的 state。因此 Decode 节点必须使用默认值关闭大页功能，
+        # 避免请求释放时将不完整的大页 state 写入 radix cache 并触发断言。
+        args.linear_att_page_block_num = 10000000
+
+    auto_set_cpu_cache_token_page_size(args, is_hybrid_model)
+    if args.enable_cpu_cache:
+        assert (
+            args.cpu_cache_token_page_size % args.page_size == 0
+        ), "--cpu_cache_token_page_size must be divisible by --page_size"
+
+    # help to manage data stored on Ceph
+    if "s3://" in args.model_dir:
+        from lightllm.utils.petrel_helper import s3_model_prepare
+
+        s3_model_prepare(args.model_dir)
+
+    _validate_and_normalize_ssm_config(args)
+
+    # 如果args.eos_id 是 None, 从 config.json 中读取 eos_token_id 相关的信息，赋值给 args
+    if args.eos_id is None:
+        from lightllm.utils.config_utils import get_eos_token_ids
+
+        args.eos_id = get_eos_token_ids(args.model_dir)
+
+    auto_set_response_parsers(args)
+
+    if args.data_type is None:
+        from lightllm.utils.config_utils import get_dtype
+
+        args.data_type = get_dtype(args.model_dir)
+        assert args.data_type in ["fp16", "float16", "bf16", "bfloat16", "fp32", "float32"]
+
+    set_unique_server_name(args)
+
+    # 确保单机上多实列不冲突
+    if args.zmq_mode == "ipc:///tmp/":
+        zmq_mode = f"{args.zmq_mode}_{get_unique_server_name()}_"
+        args.zmq_mode = None  # args 的参数不能直接设置，只能先设置None，再设置才能成功
+        args.zmq_mode = zmq_mode
+        logger.info(f"zmq mode head: {args.zmq_mode}")
+
+    # p d 分离模式下用于标识节点的id
+    args.pd_node_id = uuid.uuid4().int
+    # p d 分离模式下，decode节点的调度间隙是0
+    if args.run_mode == "decode":
+        args.router_max_wait_tokens = 0
+
+    # dp 必须 > 1
+    if args.enable_dp_prompt_cache_fetch and args.dp <= 1:
+        args.enable_dp_prompt_cache_fetch = False
+        logger.warning(
+            """dp <= 1 does not support dp_prompt_cache_fetch;
+            overriding enable_dp_prompt_cache_fetch to False"""
+        )
+
+    auto_configure_allreduce_flags_from_args(args)
+    local_request_capacity = get_running_max_req_size_per_dp(args)
+
+    # Limit CUDA Graph batches to the local request capacity.
+    if not args.disable_cudagraph and args.graph_max_batch_size > local_request_capacity:
+        logger.warning(
+            f"graph_max_batch_size {args.graph_max_batch_size} exceeds per-DP request capacity "
+            f"{local_request_capacity}; set graph_max_batch_size to {local_request_capacity}."
+        )
+        args.graph_max_batch_size = local_request_capacity
+
+    # 校验用户已设置端口冲突（对齐原 PortManager 启动检查范围）
+    ports_to_check = [args.port]
+    if args.dp == 1 and args.nnodes > 1:
+        ports_to_check.extend([args.multinode_httpmanager_port, args.multinode_router_gloo_port])
+    # ConfigServer owns and replaces its TCPStore; a surviving store must not block rank-0 restart.
+    if args.node_rank == 0 and args.nccl_port is not None and not args.use_config_server_to_init_nccl:
+        ports_to_check.append(args.nccl_port)
+    validate_ports(ports_to_check)
+
+    set_env_start_args(args)
+    process_manager.setup_exit_controller()
+    get_shm_port_args(create=True)
+    # 多机用于收发node ip, 这个地方修改了args env,所以需要重新设置一下。
+    send_and_receive_node_ip(args)
+    set_env_start_args(args)
+    logger.info(f"all start args:{args}")
+
+    if args.enable_multimodal:
+        process_manager.start_submodule_processes(
+            start_funcs=[
+                start_cache_manager,
+            ],
+            start_args=[(args,)],
+        )
+
+    if not args.disable_vision:
+        if not args.visual_use_proxy_mode:
+            from .visualserver.manager import start_visual_process
+
+            process_manager.start_submodule_processes(
+                start_funcs=[
+                    start_visual_process,
+                ],
+                start_args=[
+                    (args,),
+                ],
+            )
+        else:
+            from .visualserver.proxy_manager import start_visual_process
+
+            process_manager.start_submodule_processes(
+                start_funcs=[
+                    start_visual_process,
+                ],
+                start_args=[
+                    (args,),
+                ],
+            )
+
+    if not args.disable_audio:
+        from .audioserver.manager import start_audio_process
+
+        process_manager.start_submodule_processes(
+            start_funcs=[
+                start_audio_process,
+            ],
+            start_args=[
+                (args,),
+            ],
+        )
+
+    if args.enable_cpu_cache:
+        from .multi_level_kv_cache.manager import start_multi_level_kv_cache_manager
+
+        process_manager.start_submodule_processes(
+            start_funcs=[
+                start_multi_level_kv_cache_manager,
+            ],
+            start_args=[(args,)],
+        )
+
+    process_manager.start_submodule_processes(
+        start_funcs=[
+            start_metric_manager,
+        ],
+        start_args=[(args,)],
+    )
+    process_manager.start_submodule_processes(
+        start_funcs=[start_req_id_generator_server],
+        start_args=[(args,)],
+    )
+
+    if args.run_mode == "decode":
+        from .pd_report.manager import start_pd_report_process
+
+        process_manager.start_submodule_processes(
+            start_funcs=[start_pd_report_process],
+            start_args=[(args,)],
+        )
+
+    router_process, _ = process_manager.start_submodule_processes(
+        start_funcs=[start_router_process, start_detokenization_process],
+        start_args=[
+            (args,),
+            (args,),
+        ],
+    )
+    process_manager.register_process_tree(router_process)
+
+    return process_manager
+
+
+def _hypercorn_config_args(args: StartArgs):
+    if args.hypercorn_config is not None:
+        return ["--config", args.hypercorn_config]
+    return ["--config", "python:lightllm.server.hypercorn_config"]
+
+
+def normal_or_p_d_start(args: StartArgs):
+    process_manager = _launch_subprocesses(args)
+
+    # 启动 Hypercorn
+    command = [
+        "hypercorn",
+        *_hypercorn_config_args(args),
+        "--workers",
+        f"{args.httpserver_workers}",
+        "--bind",
+        f"{args.host}:{get_shm_port_args().port}",
+        "--log-level",
+        "info",
+        "--access-logfile",
+        "-",
+        "--error-logfile",
+        "-",
+        "lightllm.server.api_http:app",
+    ]
+
+    # 启动子进程
+    http_server_process = subprocess.Popen(command)
+
+    if "s3://" in args.model_dir:
+        from lightllm.utils.petrel_helper import s3_model_clear
+
+        s3_model_clear(args.model_dir)
+
+    if args.health_monitor:
+        from lightllm.server.health_monitor.manager import start_health_check_process
+
+        process_manager.start_submodule_processes(start_funcs=[start_health_check_process], start_args=[(args,)])
+    process_manager.setup_signal_handlers(http_server_process)
+    process_manager.supervise_processes(http_server_process)
+
+
+def pd_master_start(args: StartArgs):
+    _validate_pd_features(args)
+    _set_envs_and_config(args)
+    set_unique_server_name(args)
+    if args.run_mode != "pd_master":
+        return
+
+    auto_set_max_req_total_len(args)
+    auto_set_response_parsers(args)
+
+    # when use config_server to support multi pd_master node, we
+    # need generate unique node id for each pd_master node.
+    # otherwise, we use the 0 for single pd_master node.
+    if args.config_server_host and args.config_server_port:
+        args.pd_node_id = uuid.uuid4().int
+    else:
+        args.pd_node_id = 0
+
+    logger.info(f"use tgi api: {args.use_tgi_api}")
+
+    validate_ports([args.port])
+    set_env_start_args(args)
+    process_manager.setup_exit_controller()
+    get_shm_port_args(create=True)
+    logger.info(f"all start args:{args}")
+
+    process_manager.start_submodule_processes(
+        start_funcs=[
+            start_metric_manager,
+        ],
+        start_args=[(args,)],
+    )
+    process_manager.start_submodule_processes(
+        start_funcs=[start_req_id_generator_server],
+        start_args=[(args,)],
+    )
+
+    command = [
+        "hypercorn",
+        *_hypercorn_config_args(args),
+        "--workers",
+        "1",
+        "--bind",
+        f"{args.host}:{get_shm_port_args().port}",
+        "--log-level",
+        "info",
+        "--access-logfile",
+        "-",
+        "--error-logfile",
+        "-",
+        "lightllm.server.api_http:app",
+    ]
+
+    http_server_process = subprocess.Popen(command)
+
+    if args.health_monitor:
+        from lightllm.server.health_monitor.manager import start_health_check_process
+
+        process_manager.start_submodule_processes(start_funcs=[start_health_check_process], start_args=[(args,)])
+
+    process_manager.setup_signal_handlers(http_server_process)
+    process_manager.supervise_processes(http_server_process)
+
+
+def pd_master_multi_worker_start(args: StartArgs):
+    """Start multiple PD master workers on one host behind HAProxy."""
+    _validate_pd_features(args)
+    from .httpserver_for_pd_master.multiprocess import (
+        start_multiprocess_pd_master,
+        validate_multiprocess_pd_master_args,
+    )
+    from .httpserver_for_pd_master.pd_selector.pd_node_stats_server import start_pd_node_stats_server
+    from .httpserver_for_pd_master.pd_selector.prompt_cache_tree_server import start_prompt_cache_tree_server
+
+    haproxy_binary = validate_multiprocess_pd_master_args(args)
+    _set_envs_and_config(args)
+    set_unique_server_name(args)
+
+    auto_set_max_req_total_len(args)
+    auto_set_response_parsers(args)
+    process_manager.setup_exit_controller()
+    set_env_start_args(args)
+    get_env_start_args.cache_clear()
+    ports = get_shm_port_args(create=True)
+    worker_ports = ports.pd_master_multi_ports
+    validate_ports([args.port, ports.metric_port, *worker_ports])
+    logger.info("PD master worker ports: %s", worker_ports)
+    process_manager.start_submodule_processes(
+        start_funcs=[start_metric_manager],
+        start_args=[(args,)],
+    )
+    process_manager.start_submodule_processes(
+        start_funcs=[start_req_id_generator_server],
+        start_args=[(args,)],
+    )
+    process_manager.start_submodule_processes(
+        start_funcs=[start_pd_node_stats_server],
+        start_args=[(args,)],
+    )
+    process_manager.start_submodule_processes(
+        start_funcs=[start_prompt_cache_tree_server],
+        start_args=[(args,)],
+    )
+    return start_multiprocess_pd_master(
+        args,
+        ports=ports,
+        haproxy_binary=haproxy_binary,
+    )
+
+
+def visual_only_start(args):
+    from lightllm.server.core.objs.start_args_type import StartArgs
+
+    args: StartArgs = args
+    _set_envs_and_config(args)
+    if args.afs_image_embed_dir is not None:
+        os.makedirs(args.afs_image_embed_dir, mode=0o777, exist_ok=True)
+        os.chmod(args.afs_image_embed_dir, 0o777)
+
+    set_unique_server_name(args)
+
+    if args.visual_gpu_ids is None:
+        args.visual_gpu_ids = list(range(args.visual_dp * args.visual_tp))
+    if args.visual_infer_batch_size is None:
+        args.visual_infer_batch_size = args.visual_dp
+    if args.data_type is None:
+        from lightllm.utils.config_utils import get_dtype
+
+        args.data_type = get_dtype(args.model_dir)
+        assert args.data_type in ["fp16", "float16", "bf16", "bfloat16", "fp32", "float32"]
+
+    args.visual_node_id = uuid.uuid4().int
+
+    ports_to_check = []
+    if args.visual_rpyc_port is not None:
+        ports_to_check.append(args.visual_rpyc_port)
+    validate_ports(ports_to_check)
+    set_env_start_args(args)
+    process_manager.setup_exit_controller()
+    get_shm_port_args(create=True)
+    logger.info(f"all start args:{args}")
+
+    from .visualserver.visual_only_manager import start_visual_process
+
+    process_manager.start_submodule_processes(
+        start_funcs=[
+            start_visual_process,
+        ],
+        start_args=[
+            (args,),
+        ],
+    )
+    process_manager.setup_signal_handlers()
+    process_manager.supervise_processes()
+
+
+def config_server_start(args):
+    set_unique_server_name(args)
+    if args.run_mode != "config_server":
+        return
+
+    ports_to_check = [args.config_server_port]
+    if args.config_server_visual_redis_port is not None:
+        ports_to_check.append(args.config_server_visual_redis_port)
+    validate_ports(ports_to_check)
+    set_env_start_args(args)
+    process_manager.setup_exit_controller()
+    get_shm_port_args(create=True)
+    logger.info(f"all start args:{args}")
+
+    if args.config_server_visual_redis_port is not None:
+        start_redis_service(args)
+
+    command = [
+        "hypercorn",
+        *_hypercorn_config_args(args),
+        "--workers",
+        "1",
+        "--bind",
+        f"{args.config_server_host}:{get_shm_port_args().config_server_port}",
+        "--log-level",
+        "info",
+        "--access-logfile",
+        "-",
+        "--error-logfile",
+        "-",
+        "lightllm.server.config_server.api_http:app",
+    ]
+
+    http_server_process = subprocess.Popen(command)
+    process_manager.setup_signal_handlers(http_server_process)
+    process_manager.supervise_processes(http_server_process)
+
+
+def _validate_pd_features(args: StartArgs):
+    if args.run_mode in ("pd_master", "prefill", "decode") and args.hypercorn_config is not None:
+        # All PD roles share one WebSocket control-plane contract. A custom
+        # Hypercorn config could change message limits on one role and break
+        # control frames between the separated nodes, so PD deployments use
+        # the built-in Hypercorn defaults consistently.
+        raise ValueError("--hypercorn_config is not supported in PD mode")
+    if args.run_mode in ("pd_master", "prefill", "decode") and (
+        args.enable_rl or args.enable_return_routed_experts or args.enable_prompt_logprobs
+    ):
+        raise ValueError("PD mode does not support RL, routed experts or prompt logprobs")
+
+
+def _auto_set_prefill_queue_strategy(args: StartArgs) -> None:
+    """自动选择 prefill 排队策略；显式指定策略时保留用户配置。"""
+    if args.prefill_queue_strategy == "auto":
+        args.prefill_queue_strategy = "hrrn" if args.run_mode == "prefill" else "default"
+        logger.info(f"run_mode={args.run_mode}, auto set prefill_queue_strategy to {args.prefill_queue_strategy}")
+
+
+def _validate_and_normalize_ssm_config(args: StartArgs):
+    assert args.ssm_state_mode in ("native", "replay"), "Invalid ssm_state_mode"
+    config = args.ssm_replay_config
+    assert isinstance(config, dict), "ssm_replay_config must be a JSON object"
+    assert args.ssm_state_mode == "replay" or not config, "ssm_replay_config requires ssm_state_mode=replay"
+    if args.ssm_state_mode == "replay":
+        defaults = {"cache_len": 16, "compute_mode": "precompute" if args.mtp_step > 0 else "inline"}
+        unknown = config.keys() - defaults.keys()
+        assert not unknown, f"Unknown ssm_replay_config fields: {unknown}"
+        config = {**defaults, **config}
+        assert type(config["cache_len"]) is int and config["cache_len"] in (
+            4,
+            8,
+            16,
+            32,
+            64,
+        ), "ReplaySSM capacity must be a power of two and at least 4, up to 64"
+        assert config["compute_mode"] in ("inline", "precompute"), "Invalid replay compute_mode"
+        args.ssm_replay_config = config
+        logger.info(f"SSM mode: replay, config: {config}")
+    else:
+        logger.info(f"SSM mode: {args.ssm_state_mode}")
+    from lightllm.utils.config_utils import get_model_type
+
+    model_type = get_model_type(args.model_dir)
+    is_gdn_or_kda = model_type in (
+        "glm5_next",
+        "glm5_next_text",
+        "qwen3_next",
+        "qwen3_5",
+        "qwen3_5_moe",
+        "qwen3_5_text",
+        "qwen3_5_moe_text",
+        "sensenova_loop",
+    )
+    if is_gdn_or_kda:
+        assert args.mtp_step <= 15, (
+            "GDN/KDA requires mtp_step <= 15: " "linear attention MTP state acceptance supports verify width <= 16"
+        )
+    if args.ssm_state_mode == "native":
+        return
+    assert args.linear_att_ssm_data_type in (
+        "float32",
+        "bfloat16",
+    ), "Non-native SSM state modes require FP32 or BF16 state"
+    assert is_gdn_or_kda, "Non-native SSM state modes currently require a GDN or KDA model"
+    assert args.mtp_step >= 0, "ssm_state_mode=replay requires mtp_step >= 0"
+    capacity = config["cache_len"]
+    assert capacity >= args.mtp_step + 1, "ReplaySSM capacity must cover the verify width"

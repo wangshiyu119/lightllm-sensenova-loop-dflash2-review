@@ -1,0 +1,312 @@
+import pickle
+import os
+import threading
+import time
+from dataclasses import dataclass
+from typing import Dict
+from torch import Tensor
+from lightllm.server.pd_io_struct import PDChunckedTransTask, PDAgentMetadata
+from lightllm.utils.log_utils import init_logger
+
+
+logger = init_logger(__name__)
+
+try:
+    from nixl._api import nixl_agent as NixlWrapper
+    from nixl._api import nixlBind
+    from nixl._api import nixl_agent_config
+
+    logger.info("Nixl is available")
+except ImportError:
+    logger.warning("nixl is not installed, which is required for pd disagreggation!!!")
+    NixlWrapper = None
+
+
+class NixlKVTransporter:
+    def __init__(
+        self,
+        node_id: int,
+        tp_idx: int,
+        kv_move_buffer: Tensor,
+        pd_page_kind_payload_bytes: dict[str, int],
+    ):
+        self.node_id = node_id
+        self.tp_idx = tp_idx
+        self.capture_telemetry = os.getenv("LIGHTLLM_NIXL_CAPTURE_TELEMETRY", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        conf = None
+        if self.capture_telemetry:
+            conf = nixl_agent_config()
+            conf.capture_telemetry = True
+            logger.info("NIXL telemetry enabled")
+        self.nixl_agent = NixlWrapper(self.agent_name, conf)
+        page_bytes = kv_move_buffer[0].numel() * kv_move_buffer.element_size()
+        self.pd_page_kind_payload_bytes = dict(pd_page_kind_payload_bytes)
+        assert set(self.pd_page_kind_payload_bytes) <= {"kv", "att_state"} and self.pd_page_kind_payload_bytes
+        assert all(0 < size <= page_bytes for size in self.pd_page_kind_payload_bytes.values())
+        self._register_kv_move_buffer(kv_move_buffer=kv_move_buffer)
+        self.remote_agents: Dict[str, PDAgentMetadata] = {}
+        # Serialize complete peer add/remove operations, including native NIXL
+        # calls and descriptor cleanup, across worker threads (see GH-1470).
+        self._remote_agents_lock = threading.Lock()
+        return
+
+    @property
+    def agent_name(self) -> str:
+        return f"{self.node_id}_{self.tp_idx}"
+
+    @property
+    def agent_metadata(self):
+        return self.nixl_agent.get_agent_metadata()
+
+    @property
+    def local_page_mem_desc(self):
+        return pickle.dumps(
+            {
+                "memory": self.nixl_agent.get_serialized_descs(self.page_reg_desc),
+                "pd_page_kind_payload_bytes": self.pd_page_kind_payload_bytes,
+            }
+        )
+
+    def get_new_notifs(self) -> Dict[str, list[bytes]]:
+        return self.nixl_agent.get_new_notifs()
+
+    def _register_kv_move_buffer(self, kv_move_buffer: Tensor):
+        self.num_pages = kv_move_buffer.shape[0]
+        self.page_bytes = kv_move_buffer[0].numel() * kv_move_buffer.element_size()
+        self.page_reg_desc = self.nixl_agent.register_memory(kv_move_buffer)
+        self.page_local_xfer_handles = self._create_paged_xfer_handles(self.page_reg_desc, self.num_pages)
+
+    def _create_paged_xfer_handles(self, reg_desc: "nixlBind.nixlRegDList", page_num: int, agent_name: str = ""):
+        base_addr, registered_bytes, device_id, _ = reg_desc[0]
+        # NIXL 原生描述记录整块注册内存的字节数，按对端页数检查单页容量是否一致。
+        assert registered_bytes == page_num * self.page_bytes, "PD peers must use the same page byte capacity"
+        handles = {}
+        for kind, payload_bytes in self.pd_page_kind_payload_bytes.items():
+            pages_data = [
+                (base_addr + page_id * self.page_bytes, payload_bytes, device_id) for page_id in range(page_num)
+            ]
+            descs = self.nixl_agent.get_xfer_descs(pages_data, "VRAM")
+            handles[kind] = self.nixl_agent.prep_xfer_dlist(agent_name, descs, "VRAM")
+        return handles
+
+    def connect_add_remote_agent(self, remote_agent: PDAgentMetadata):
+        with self._remote_agents_lock:
+            if remote_agent.agent_name in self.remote_agents:
+                return
+
+            start_time = time.time()
+            page_reg_desc = pickle.loads(remote_agent.page_reg_desc)
+            assert (
+                page_reg_desc["pd_page_kind_payload_bytes"] == self.pd_page_kind_payload_bytes
+            ), "PD peers must use the same payload byte lengths"
+
+            peer_name = self.nixl_agent.add_remote_agent(remote_agent.agent_metadata)
+            if isinstance(peer_name, bytes):
+                peer_name = peer_name.decode()
+
+            assert (
+                peer_name == remote_agent.agent_name
+            ), f"Peer name {peer_name} does not match remote name {remote_agent.agent_name}"
+
+            page_mem_desc = self.nixl_agent.deserialize_descs(page_reg_desc["memory"])
+            page_kind_xfer_handles = self._create_paged_xfer_handles(
+                page_mem_desc, remote_agent.num_pages, agent_name=peer_name
+            )
+            remote_agent.page_xfer_handles = page_kind_xfer_handles
+
+            logger.info(
+                f"Added remote agent {peer_name} with mem desc {page_mem_desc} cost time: {time.time() - start_time} s"
+            )
+
+            self.remote_agents[remote_agent.agent_name] = remote_agent
+        return
+
+    def remove_remote_agent(self, peer_name: str):
+        with self._remote_agents_lock:
+            remote_agent: PDAgentMetadata = self.remote_agents.pop(peer_name, None)
+            if remote_agent is not None:
+                start_time = time.monotonic()
+                try:
+                    assert remote_agent.agent_name == peer_name
+                    self.nixl_agent.remove_remote_agent(remote_agent.agent_name)
+                    if remote_agent.page_xfer_handles is not None:
+                        for handle in remote_agent.page_xfer_handles.values():
+                            self.nixl_agent.release_dlist_handle(handle)
+                    logger.info(f"Removed remote agent {peer_name}, cost time: {time.monotonic() - start_time:.6f} s")
+                except BaseException as e:
+                    logger.error(
+                        f"remove remote agent {peer_name} failed, cost time: {time.monotonic() - start_time:.6f} s"
+                    )
+                    logger.exception(str(e))
+            else:
+                logger.warning(f"try to remove remote agent, but peer name {peer_name} agent did not exist")
+
+    def send_write_done_task_to_decode_node(self, trans_task: PDChunckedTransTask):
+        decode_agent_name = trans_task.decode_agent_name
+        if decode_agent_name not in self.remote_agents:
+            logger.warning(f"decode_agent_name {decode_agent_name} not exist")
+            _remote_agent = trans_task.create_decode_agent_obj()
+            self.connect_add_remote_agent(_remote_agent)
+
+        new_trans_task: PDChunckedTransTask = trans_task.copy_for_notify()
+        new_trans_task.write_stage = "done"
+        new_trans_task.decode_agent_metadata = None
+        new_trans_task.decode_page_reg_desc = None
+        new_trans_task.prefill_agent_name = self.agent_name
+        new_trans_task.prefill_agent_metadata = self.agent_metadata
+        new_trans_task.prefill_num_pages = self.num_pages
+        new_trans_task.prefill_page_reg_desc = self.local_page_mem_desc
+        self.nixl_agent.send_notif(
+            remote_agent_name=decode_agent_name,
+            notif_msg=pickle.dumps(new_trans_task),
+        )
+        return
+
+    def send_write_request_task_to_decode_node(self, trans_task: PDChunckedTransTask):
+        decode_agent_name = trans_task.decode_agent_name
+        if decode_agent_name not in self.remote_agents:
+            logger.warning(f"decode_agent_name {decode_agent_name} not exist")
+            _remote_agent = trans_task.create_decode_agent_obj()
+            self.connect_add_remote_agent(_remote_agent)
+
+        new_trans_task: PDChunckedTransTask = trans_task.copy_for_notify()
+        new_trans_task.write_stage = "request"
+        new_trans_task.prefill_agent_name = self.agent_name
+        new_trans_task.prefill_agent_metadata = self.agent_metadata
+        new_trans_task.prefill_num_pages = self.num_pages
+        new_trans_task.prefill_page_reg_desc = self.local_page_mem_desc
+        self.nixl_agent.send_notif(
+            remote_agent_name=decode_agent_name,
+            notif_msg=pickle.dumps(new_trans_task),
+        )
+        return
+
+    def send_write_ready_task_to_prefill_node(self, trans_task: PDChunckedTransTask):
+        prefill_agent_name = trans_task.prefill_agent_name
+        if prefill_agent_name not in self.remote_agents:
+            logger.warning(f"prefill_agent_name {prefill_agent_name} not exist")
+            _remote_agent = trans_task.create_prefill_agent_obj()
+            self.connect_add_remote_agent(_remote_agent)
+
+        new_trans_task: PDChunckedTransTask = trans_task.copy_for_notify()
+        new_trans_task.write_stage = "ready"
+        new_trans_task.decode_agent_name = self.agent_name
+        new_trans_task.decode_agent_metadata = self.agent_metadata
+        new_trans_task.decode_num_pages = self.num_pages
+        new_trans_task.decode_page_reg_desc = self.local_page_mem_desc
+        self.nixl_agent.send_notif(
+            remote_agent_name=prefill_agent_name,
+            notif_msg=pickle.dumps(new_trans_task),
+        )
+        return
+
+    def send_error_info_to_prefill_node(self, trans_task: PDChunckedTransTask):
+        # decode node 主动发送错误信息给 prefill node, 但是只有到达一定阶段的任务才有对端的信息
+        # 才能发送
+        if trans_task.prefill_agent_name is None:
+            return
+
+        try:
+            prefill_agent_name = trans_task.prefill_agent_name
+            if prefill_agent_name not in self.remote_agents:
+                logger.warning(f"prefill_agent_name {prefill_agent_name} not exist")
+                _remote_agent = trans_task.create_prefill_agent_obj()
+                self.connect_add_remote_agent(_remote_agent)
+            assert trans_task.error_info is not None
+            new_trans_task: PDChunckedTransTask = trans_task.copy_for_notify()
+            new_trans_task.write_stage = "error"
+            new_trans_task.decode_agent_name = self.agent_name
+            new_trans_task.decode_agent_metadata = self.agent_metadata
+            new_trans_task.decode_num_pages = self.num_pages
+            new_trans_task.decode_page_reg_desc = self.local_page_mem_desc
+            self.nixl_agent.send_notif(
+                remote_agent_name=prefill_agent_name,
+                notif_msg=pickle.dumps(new_trans_task),
+            )
+        except BaseException as e:
+            logger.error(f"send error info to prefill node failed: {trans_task.to_str()}")
+            logger.exception(str(e))
+            self.remove_remote_agent(peer_name=prefill_agent_name)
+        return
+
+    def send_error_info_to_decode_node(self, trans_task: PDChunckedTransTask):
+        try:
+            decode_agent_name = trans_task.decode_agent_name
+            if decode_agent_name not in self.remote_agents:
+                logger.warning(f"decode_agent_name {decode_agent_name} not exist")
+                _remote_agent = trans_task.create_decode_agent_obj()
+                self.connect_add_remote_agent(_remote_agent)
+            assert trans_task.error_info is not None
+            new_trans_task: PDChunckedTransTask = trans_task.copy_for_notify()
+            new_trans_task.write_stage = "error"
+            new_trans_task.prefill_agent_name = self.agent_name
+            new_trans_task.prefill_agent_metadata = self.agent_metadata
+            new_trans_task.prefill_num_pages = self.num_pages
+            new_trans_task.prefill_page_reg_desc = self.local_page_mem_desc
+            self.nixl_agent.send_notif(
+                remote_agent_name=decode_agent_name,
+                notif_msg=pickle.dumps(new_trans_task),
+            )
+        except BaseException as e:
+            logger.error(f"send error info to decode node failed: {trans_task.to_str()}")
+            logger.exception(str(e))
+            self.remove_remote_agent(peer_name=decode_agent_name)
+        return
+
+    def write_blocks_paged(
+        self,
+        trans_task: PDChunckedTransTask,
+    ) -> int:
+        """
+        prefill node call this function to write kv blocks into decode node pages
+        """
+        decode_agent_name = trans_task.decode_agent_name
+        if decode_agent_name not in self.remote_agents:
+            logger.warning(f"decode_agent_name {decode_agent_name} not exist")
+            _remote_agent = trans_task.create_decode_agent_obj()
+            self.connect_add_remote_agent(_remote_agent)
+
+        assert trans_task.src_page_index is not None and trans_task.dst_page_index is not None
+        remote_agent: PDAgentMetadata = self.remote_agents[decode_agent_name]
+        src_handle = self.page_local_xfer_handles[trans_task.page_kind]
+        dst_handle = remote_agent.page_xfer_handles[trans_task.page_kind]
+        handle = self.nixl_agent.make_prepped_xfer(
+            "WRITE",
+            src_handle,
+            [trans_task.src_page_index],
+            dst_handle,
+            [trans_task.dst_page_index],
+            b"",
+        )
+        if not handle:
+            raise RuntimeError(f"make_prepped_xfer failed for task: {trans_task.to_str()}")
+
+        self.nixl_agent.transfer(handle)
+
+        return handle
+
+    def check_task_status(self, trans_task: PDChunckedTransTask) -> str:
+        assert trans_task.xfer_handle is not None
+        handle = trans_task.xfer_handle
+        xfer_state = self.nixl_agent.check_xfer_state(handle)
+        if xfer_state == "ERR":
+            logger.warning(f"Transfer failed with trans task {trans_task.to_str()} for handle {handle}")
+        return xfer_state
+
+    def release_xfer_handle(self, handle):
+        self.nixl_agent.release_xfer_handle(handle=handle)
+        return
+
+    def shutdown(self):
+        self.nixl_agent.deregister_memory(self.page_reg_desc)
+        for handle in self.page_local_xfer_handles.values():
+            self.nixl_agent.release_dlist_handle(handle)
+        agent_names = list(self.remote_agents.keys())
+        for agent_name in agent_names:
+            self.remove_remote_agent(agent_name)
+        return

@@ -1,0 +1,209 @@
+import torch
+from typing import Optional, Tuple
+from abc import ABC, abstractmethod
+from lightllm.utils.dist_utils import get_current_rank_in_dp, get_dp_world_size
+
+
+class SliceMixinBase(ABC):
+    """切片操作的Mixin基类"""
+
+    def __init__(self, tp_rank: int = None, tp_world_size: int = None, repeat_times: int = 1):
+        self.tp_rank_ = tp_rank if tp_rank is not None else get_current_rank_in_dp()
+        self.tp_world_size_ = tp_world_size if tp_world_size is not None else get_dp_world_size()
+        # this param is used to slice the weight when tp_world_size_ is divisible by the kv_head_num
+        # for example, if tp_world_size_ is 8 and kv_head_num is 4, then repeat_times_ is 2
+        self.repeat_times_ = repeat_times
+
+    @abstractmethod
+    def _slice_weight(self, weight: torch.Tensor):
+        pass
+
+    @abstractmethod
+    def _slice_bias(self, bias):
+        pass
+
+    def _get_slice_start_end(self, size: int) -> Tuple[int, int]:
+        tp_size = size * self.repeat_times_ // self.tp_world_size_
+        start = tp_size * (self.tp_rank_ // self.repeat_times_)
+        end = start + tp_size
+        return start, end
+
+    def _assert_weight_ndim(self, tensor: torch.Tensor) -> None:
+        # 2D: 普通 linear (out, in); 3D: MoE 合并权重 (num_experts, out, in)。
+        assert tensor.dim() in (2, 3), f"expect weight ndim in (2, 3), got shape {tuple(tensor.shape)}"
+
+
+class SliceMixinTpl(SliceMixinBase):
+    def __init__(self, tp_rank: int = None, tp_world_size: int = None, repeat_times: int = 1):
+        super().__init__(tp_rank, tp_world_size, repeat_times)
+
+    def _slice_weight(self, weight: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError("slice_weight must implement this method")
+
+    def _slice_bias(self, bias) -> torch.Tensor:
+        raise NotImplementedError("slice_bias must implement this method")
+
+    def _slice_weight_scale(self, weight_scale: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError("slice_weight_scale must implement this method")
+
+    def _slice_weight_zero_point(self, weight_zero_point: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError("slice_weight_zero_point must implement this method")
+
+
+# 默认 weight 的 shape 末两维是 (out, in)，普通 linear 是 2D (out, in)，
+# MoE 合并权重则是 3D (num_experts, out, in)，统一通过 `...` 处理任意前导维。
+# 约定 row-wise 沿着 out 维（倒数第二维）切分，col-wise 沿着 in 维（最后一维）切分。
+class RowSliceMixin(SliceMixinTpl):
+    def __init__(self, tp_rank: int = None, tp_world_size: int = None, repeat_times: int = 1):
+        super().__init__(tp_rank, tp_world_size, repeat_times)
+
+    def _slice_weight(self, weight: torch.Tensor) -> torch.Tensor:
+        self._assert_weight_ndim(weight)
+        assert (
+            weight.shape[-2] * self.repeat_times_ % self.tp_world_size_ == 0
+        ), f"tp slice error {weight.shape[-2] * self.repeat_times_} % {self.tp_world_size_}"
+        start, end = self._get_slice_start_end(weight.shape[-2])
+        return weight[..., start:end, :]
+
+    def _slice_bias(self, bias: torch.Tensor) -> torch.Tensor:
+        assert (
+            bias.shape[0] * self.repeat_times_ % self.tp_world_size_ == 0
+        ), f"tp slice error {bias.shape[0] * self.repeat_times_} % {self.tp_world_size_}"
+        start, end = self._get_slice_start_end(bias.shape[0])
+        return bias[start:end]
+
+
+# 量化切片默认实现方式是group-wise的量化，所以weight_scale 和weight_zero_point ndims跟weight一样。
+# 后续按需要，扩展per-tensor、per-channel的量化方式。
+class QuantizedRowSliceMixin(RowSliceMixin):
+    def __init__(self, tp_rank: int = None, tp_world_size: int = None, repeat_times: int = 1):
+        super().__init__(tp_rank, tp_world_size, repeat_times)
+
+    def _slice_weight_scale(self, weight_scale: torch.Tensor) -> torch.Tensor:
+        self._assert_weight_ndim(weight_scale)
+        assert (
+            weight_scale.shape[-2] % self.tp_world_size_ == 0
+        ), f"tp slice error {weight_scale.shape[-2]} % {self.tp_world_size_}"
+        start, end = self._get_slice_start_end(weight_scale.shape[-2])
+        return weight_scale[..., start:end, :]
+
+    def _slice_weight_zero_point(self, weight_zero_point: torch.Tensor) -> torch.Tensor:
+        self._assert_weight_ndim(weight_zero_point)
+        assert (
+            weight_zero_point.shape[-2] % self.tp_world_size_ == 0
+        ), f"tp slice error {weight_zero_point.shape[-2]} % {self.tp_world_size_}"
+        start, end = self._get_slice_start_end(weight_zero_point.shape[-2])
+        return weight_zero_point[..., start:end, :]
+
+
+class ColSliceMixin(SliceMixinTpl):
+    def __init__(self, tp_rank: int = None, tp_world_size: int = None, repeat_times: int = 1):
+        super().__init__(tp_rank, tp_world_size, repeat_times)
+
+    def _slice_weight(self, weight: torch.Tensor) -> torch.Tensor:
+        self._assert_weight_ndim(weight)
+        assert (
+            weight.shape[-1] * self.repeat_times_ % self.tp_world_size_ == 0
+        ), f"tp slice error {weight.shape[-1] * self.repeat_times_ } % {self.tp_world_size_}"
+        start, end = self._get_slice_start_end(weight.shape[-1])
+        return weight[..., start:end]
+
+    def _slice_bias(self, bias: torch.Tensor) -> torch.Tensor:
+        return bias / self.tp_world_size_ * self.repeat_times_
+
+
+class QuantizedColSliceMixin(ColSliceMixin):
+    def __init__(self, tp_rank: int = None, tp_world_size: int = None, repeat_times: int = 1):
+        super().__init__(tp_rank, tp_world_size, repeat_times)
+
+    def _slice_weight_scale(self, weight_scale: torch.Tensor) -> torch.Tensor:
+        self._assert_weight_ndim(weight_scale)
+        assert (
+            weight_scale.shape[-1] * self.repeat_times_ % self.tp_world_size_ == 0
+        ), f"tp slice error {weight_scale.shape[-1] * self.repeat_times_ } % {self.tp_world_size_}"
+        start, end = self._get_slice_start_end(weight_scale.shape[-1])
+        return weight_scale[..., start:end]
+
+    def _slice_weight_zero_point(self, weight_zero_point: torch.Tensor) -> torch.Tensor:
+        self._assert_weight_ndim(weight_zero_point)
+        assert (
+            weight_zero_point.shape[-1] * self.repeat_times_ % self.tp_world_size_ == 0
+        ), f"tp slice error {weight_zero_point.shape[-1] * self.repeat_times_ } % {self.tp_world_size_}"
+        start, end = self._get_slice_start_end(weight_zero_point.shape[-1])
+        return weight_zero_point[..., start:end]
+
+
+# awq 的量化权重是inxout存储格式，需要定制实现。
+class AwqQuantizedRowSliceMixin(QuantizedColSliceMixin):
+    def __init__(self, tp_rank: int = None, tp_world_size: int = None, repeat_times: int = 1):
+        super().__init__(tp_rank, tp_world_size, repeat_times)
+
+    def _slice_bias(self, bias: torch.Tensor) -> torch.Tensor:
+        assert (
+            bias.shape[0] * self.repeat_times_ % self.tp_world_size_ == 0
+        ), f"tp slice error {bias.shape[0] * self.repeat_times_ } % {self.tp_world_size_}"
+        start, end = self._get_slice_start_end(bias.shape[0])
+        return bias[start:end]
+
+
+class AwqQuantizedColSliceMixin(QuantizedRowSliceMixin):
+    def __init__(self, tp_rank: int = None, tp_world_size: int = None, repeat_times: int = 1):
+        super().__init__(tp_rank, tp_world_size, repeat_times)
+
+    def _slice_bias(self, bias: torch.Tensor) -> torch.Tensor:
+        return bias / self.tp_world_size_ * self.repeat_times_
+
+
+class BMMRowSliceMixin(SliceMixinTpl):
+    """BMM weight is (heads, dim1, dim2); TP splits along heads (dim0).
+
+    Unlike RowSliceMixin (for 2D linear / MoE (experts, out, in) which slice -2),
+    BMM must not slice the middle dim.
+
+    BMM currently only supports unquantized float/bf16 weights (see BMMWeightTpl:
+    quant_method must be None). Bias / weight_scale / zero_point are unsupported.
+    """
+
+    def __init__(self, tp_rank: int = None, tp_world_size: int = None, repeat_times: int = 1):
+        super().__init__(tp_rank, tp_world_size, repeat_times)
+
+    def _slice_weight(self, weight: torch.Tensor) -> torch.Tensor:
+        assert weight.dim() == 3, f"BMM weight expect 3D, got shape {tuple(weight.shape)}"
+        assert (
+            weight.shape[0] * self.repeat_times_ % self.tp_world_size_ == 0
+        ), f"tp slice error {weight.shape[0] * self.repeat_times_} % {self.tp_world_size_}"
+        start, end = self._get_slice_start_end(weight.shape[0])
+        return weight[start:end]
+
+    def _slice_bias(self, bias: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError("BMM does not support bias")
+
+    def _slice_weight_scale(self, weight_scale: torch.Tensor) -> torch.Tensor:
+        # BMMWeightTpl rejects quant_method; quantized weight load is not supported.
+        raise NotImplementedError("BMM does not support quantized weight loading (weight_scale)")
+
+    def _slice_weight_zero_point(self, weight_zero_point: torch.Tensor) -> torch.Tensor:
+        # BMMWeightTpl rejects quant_method; quantized weight load is not supported.
+        raise NotImplementedError("BMM does not support quantized weight loading (zero_point)")
+
+
+def get_row_slice_mixin(
+    quant_method_name: str, tp_rank: int = None, tp_world_size: int = None, repeat_times: int = 1
+) -> SliceMixinTpl:
+    if quant_method_name.startswith("awq"):
+        return AwqQuantizedRowSliceMixin(tp_rank, tp_world_size, repeat_times)
+    elif quant_method_name == "none":
+        return RowSliceMixin(tp_rank, tp_world_size, repeat_times)
+    else:
+        return QuantizedRowSliceMixin(tp_rank, tp_world_size, repeat_times)
+
+
+def get_col_slice_mixin(
+    quant_method_name: str, tp_rank: int = None, tp_world_size: int = None, repeat_times: int = 1
+) -> SliceMixinTpl:
+    if quant_method_name.startswith("awq"):
+        return AwqQuantizedColSliceMixin(tp_rank, tp_world_size, repeat_times)
+    elif quant_method_name == "none":
+        return ColSliceMixin(tp_rank, tp_world_size, repeat_times)
+    else:
+        return QuantizedColSliceMixin(tp_rank, tp_world_size, repeat_times)

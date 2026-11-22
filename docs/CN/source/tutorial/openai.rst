@@ -1,0 +1,296 @@
+.. _openai_api:
+
+LightLLM OpenAI 接口调用示例
+============================
+
+LightLLM 提供了与 OpenAI API 完全兼容的接口，支持所有标准的 OpenAI 功能，包括 function calling。本文档将详细介绍如何使用 LightLLM 的 OpenAI 接口。
+
+基础配置
+--------
+
+首先确保 LightLLM 服务已经启动：
+
+.. code-block:: bash
+
+    # 启动 LightLLM 服务
+    python -m lightllm.server.api_server \
+        --model_dir /path/to/your/model \
+        --port 8088 \
+        --tp 1
+
+停止字符串
+----------
+
+``/v1/chat/completions`` 和 ``/v1/completions`` 支持 ``stop`` 和
+``include_stop_str_in_output``。默认返回文本不包含匹配到的 stop 字符串，
+设置 ``include_stop_str_in_output=true`` 可保留 stop。两种设置都会移除同一
+token 内 stop 之后的文本。流式、非流式以及 PD 部署遵循相同设置。
+字符串 stop 保留原文，不会编码成 token ID 序列，也不会在推理层按 token ID 匹配。
+
+使用 OpenAI Python 客户端时，通过 ``extra_body`` 传入：
+
+.. code-block:: python
+
+    response = client.chat.completions.create(
+        model="your_model_name",
+        messages=[{"role": "user", "content": "你好"}],
+        stop=["END"],
+        extra_body={"include_stop_str_in_output": True},
+    )
+
+例如生成 ``helloEND`` 时，默认返回 ``hello``，开启后返回 ``helloEND``。
+
+使用 ``/v1/chat/completions`` 且配置了 reasoning parser（自动识别或使用 ``--reasoning_parser``）时，用户设置的
+字符串 stop 默认只作用于最终回答的 ``content``，reasoning 中出现相同字符串不会结束生成。
+即使设置 ``separate_reasoning=False`` 合并返回两个部分，停止范围也遵循这个规则。
+EOS 和输出 token 长度上限仍可在任意阶段结束生成。
+
+如需让字符串 stop 在 reasoning 中也生效，在启动服务前设置：
+
+.. code-block:: bash
+
+    export LIGHTLLM_STOP_IN_REASONING=1
+
+默认为 ``0``，``1``、``true``、``ON`` 均可开启。修改后需要重启服务；PD 部署在接收
+OpenAI 请求的 master 上设置，停止范围通过请求采样参数传递给 P/D 节点。
+``/v1/completions`` 对全部生成文本匹配 stop；Chat 接口未配置 reasoning parser 时也采用此行为。
+
+上述阶段范围仅影响字符串 stop。原生接口 ``parameters.stop_sequences`` 中显式传入的
+token ID 序列由推理层和 HTTP 输出层独立匹配，可在 reasoning 和回答阶段结束生成；
+不受此环境变量和 ``include_stop_str_in_output`` 影响。
+
+RL、返回 routed experts 和 prompt logprobs 仅支持普通模式。此类请求命中 stop 时仍通知后端停止，
+字符串命中包按 ``include_stop_str_in_output`` 截断文本，但保留后端结束状态；后续包原样放行，
+直到后端结束包返回最终 metadata。因此命中后仍可能返回在途 token，最终结束原因由后端决定。
+PD 分离模式启动时拒绝这些功能开关；请求参数不能启用对应的服务端功能。
+
+基础对话示例
+------------
+
+1. 简单对话
+~~~~~~~~~~~
+
+.. code-block:: python
+
+    import requests
+    import json
+
+    # 配置
+    url = "http://localhost:8088/v1/chat/completions"
+    headers = {"Content-Type": "application/json"}
+
+    # 请求数据
+    data = {
+        "model": "your_model_name",
+        "messages": [
+            {"role": "user", "content": "你好，请介绍一下你自己"}
+        ],
+        "temperature": 0.7,
+        "max_tokens": 1000
+    }
+
+    # 发送请求
+    response = requests.post(url, headers=headers, json=data)
+    
+    if response.status_code == 200:
+        result = response.json()
+        print("回复:", result["choices"][0]["message"]["content"])
+    else:
+        print("错误:", response.status_code, response.text)
+
+2. 流式对话
+~~~~~~~~~~~
+
+.. code-block:: python
+
+    import requests
+    import json
+
+    url = "http://localhost:8088/v1/chat/completions"
+    headers = {"Content-Type": "application/json"}
+
+    data = {
+        "model": "your_model_name",
+        "messages": [
+            {"role": "user", "content": "请写一个关于人工智能的短文"}
+        ],
+        "stream": True,
+        "temperature": 0.7,
+        "max_tokens": 1000
+    }
+
+    # 流式请求
+    response = requests.post(url, headers=headers, json=data, stream=True)
+    
+    if response.status_code == 200:
+        for line in response.iter_lines():
+            if line:
+                line = line.decode('utf-8')
+                if line.startswith('data: '):
+                    data_str = line[6:]  # 移除 "data: " 前缀
+                    if data_str == '[DONE]':
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                        if chunk['choices'][0]['delta'].get('content'):
+                            print(chunk['choices'][0]['delta']['content'], end='', flush=True)
+                    except json.JSONDecodeError:
+                        continue
+    else:
+        print("错误:", response.status_code, response.text)
+
+Function Calling 示例
+---------------------
+
+LightLLM 支持 OpenAI 的 function calling 功能，提供了三种模型的函数调用解析，启动服务的时候指定 --tool_call_parser 参数来选择。启动服务命令为：
+
+.. code-block:: bash
+
+    python -m lightllm.server.api_server \
+        --model_dir /path/to/your/model \
+        --port 8088 \
+        --tp 1 \
+        --tool_call_parser qwen25
+    # 可选的参数为 qwen25, llama3, mistral
+
+1. 基础 Function Calling
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: python
+
+    import requests
+    import json
+
+    url = "http://localhost:8088/v1/chat/completions"
+    headers = {"Content-Type": "application/json"}
+
+    # 定义函数
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_current_weather",
+                "description": "获取指定城市的当前天气信息",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": {
+                            "type": "string",
+                            "description": "城市名称，例如：北京、上海"
+                        },
+                        "unit": {
+                            "type": "string",
+                            "enum": ["celsius", "fahrenheit"],
+                            "description": "温度单位"
+                        }
+                    },
+                    "required": ["city"]
+                }
+            }
+        }
+    ]
+
+    # 请求数据
+    data = {
+        "model": "your_model_name",
+        "messages": [
+            {"role": "user", "content": "北京今天天气怎么样？"}
+        ],
+        "tools": tools,
+        "tool_choice": "auto",  # 让模型自动决定是否调用函数
+        "temperature": 0.7,
+        "max_tokens": 1000
+    }
+
+    # 发送请求
+    response = requests.post(url, headers=headers, json=data)
+    
+    if response.status_code == 200:
+        result = response.json()
+        message = result["choices"][0]["message"]
+        
+        # 检查是否有函数调用
+        if message.get("tool_calls"):
+            print("模型决定调用函数:")
+            for tool_call in message["tool_calls"]:
+                print(f"函数名: {tool_call['function']['name']}")
+                print(f"参数: {tool_call['function']['arguments']}")
+        else:
+            print("回复:", message["content"])
+    else:
+        print("错误:", response.status_code, response.text)
+
+2. 流式 Function Calling
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: python
+
+    import requests
+    import json
+
+    url = "http://localhost:8088/v1/chat/completions"
+    headers = {"Content-Type": "application/json"}
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "calculate",
+                "description": "执行数学计算",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "expression": {"type": "string", "description": "数学表达式"}
+                    },
+                    "required": ["expression"]
+                }
+            }
+        }
+    ]
+
+    data = {
+        "model": "your_model_name",
+        "messages": [
+            {"role": "user", "content": "请计算 25 * 4 + 10 的结果"}
+        ],
+        "tools": tools,
+        "tool_choice": "auto",
+        "stream": True,
+        "temperature": 0.7,
+        "max_tokens": 1000
+    }
+
+    response = requests.post(url, headers=headers, json=data, stream=True)
+    
+    if response.status_code == 200:
+        content_buffer = ""
+        tool_calls_buffer = []
+        
+        for line in response.iter_lines():
+            if line:
+                line = line.decode('utf-8')
+                if line.startswith('data: '):
+                    data_str = line[6:]
+                    if data_str == '[DONE]':
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                        delta = chunk['choices'][0]['delta']
+                        
+                        # 处理内容
+                        if delta.get('content'):
+                            content_buffer += delta['content']
+                            print(delta['content'], end='', flush=True)
+                        
+                        # 处理函数调用
+                        if delta.get('tool_calls'):
+                            for tool_call in delta['tool_calls']:
+                                tool_calls_buffer.append(tool_call)
+                                print(f"\n[函数调用: {tool_call['function']['name']}]")
+                                if tool_call['function'].get('arguments'):
+                                    print(f"参数: {tool_call['function']['arguments']}")
+                                    
+                    except json.JSONDecodeError:
+                        continue
+    else:
+        print("错误:", response.status_code, response.text)

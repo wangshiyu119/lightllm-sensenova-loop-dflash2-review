@@ -1,0 +1,276 @@
+"""Sampling parameters for text generation.
+本文件中定义的 SamplingParams 类是与 sampling_params.py 文件中实现的 基于ctypes 实现的 SamplingParams 具有
+相同的功能，主要用于便于转化的易用性，目前在约束输出部分有使用到。
+"""
+import os
+from typing import List, Optional, Union, Tuple
+from lightllm.server.httpserver.req_id_generator_server import MAX_BEST_OF
+from lightllm.utils.grammar_utils import validate_grammar
+from .sampling_params import MAX_SEED, StopStrMatchMode
+
+
+_SAMPLING_EPS = 1e-5
+# 用环境变量控制是否进行输入惩罚的默认值
+DEFAULT_INPUT_PENALTY = os.getenv("INPUT_PENALTY", "False").upper() in ["ON", "TRUE", "1"]
+
+
+class SamplingParams:
+
+    _do_sample: bool = False
+    _presence_penalty: float = 0.0
+    _frequency_penalty: float = 0.0
+    _repetition_penalty: float = 1.0
+    _temperature: float = 1.0
+    _top_p: float = 1.0
+    _top_k: int = -1  # -1 is for all
+    _stop_sequences: Optional[Union[str, List[Union[str, List[int]]]]] = None
+
+    def __init__(
+        self,
+        best_of: int = 1,
+        n: int = None,  # number of results
+        do_sample: bool = None,
+        presence_penalty: float = None,
+        frequency_penalty: float = None,
+        repetition_penalty: float = None,
+        exponential_decay_length_penalty: Tuple[int, float] = (1, 1.0),
+        temperature: float = None,
+        top_p: float = None,
+        top_k: int = None,  # -1 is for all
+        ignore_eos: bool = False,
+        image_max_patch_num: int = -1,
+        max_new_tokens: int = 65535,
+        min_new_tokens: int = 1,
+        # 字符串保留原文供 detokenization / HTTP 匹配；显式 token ID 序列始终由推理层匹配。
+        stop_sequences: Optional[Union[str, List[Union[str, List[int]]]]] = None,
+        skip_special_tokens: bool = True,  # whether to skip special tokens when decoding
+        add_special_tokens: bool = True,  # whether to add special tokens when encoding
+        add_spaces_between_special_tokens: bool = True,  # whether to add spaces between special tokens when decoding
+        print_eos_token: bool = False,  # eos_id will be always ignored except the value is set to True
+        # Whether to count input tokens for presence_penalty, frequency_penalty and repetition_penalty
+        input_penalty: bool = DEFAULT_INPUT_PENALTY,
+        regular_constraint: Optional[str] = None,  # Regular expressions constrain the output.
+        guided_grammar: Optional[str] = None,  # EBNF constrain the output.
+        guided_json: Optional[Union[str, dict]] = None,  # JSON schema constrain the output.
+        # if provided, the invalid token ids will be ignored during generation
+        invalid_token_ids: Optional[List[int]] = None,
+        # p d mode used params
+        group_request_id: Optional[int] = None,
+        # suggest dp index, deepseekv2 dp mode, use to suggest used dp_index
+        suggested_dp_index: Optional[int] = None,
+        seed: Optional[int] = -1,
+        # 是否保留命中的字符串 stop；False 时移除 stop，True 时保留。
+        # 两种设置都会移除同一 token 中 stop 后的文本；不影响 token ID stop 序列。
+        include_stop_str_in_output: bool = False,
+        # stop 检测的初始推理状态提示：-1 使用 parser 默认值，0 为回答，1 为思考。
+        # 用于初始化当前请求或 PD 续跑段；运行时状态由 StopStrMatchBuffer 维护。
+        _initial_reasoning_state: int = -1,
+        # stop 匹配策略，取值见 StopStrMatchMode；由接口入口设置，随请求传递到各进程和 P/D 节点。
+        # 默认 ALL_TEXT；Chat 接口需要跳过 reasoning 时使用 CONTENT_ONLY。
+        stop_str_match_mode: int = StopStrMatchMode.ALL_TEXT,
+        guided_reasoning_end: Optional[List[int]] = None,
+        pd_previous_output_len: int = 0,
+    ) -> None:
+        self.best_of = best_of
+        self.n = n
+        self.do_sample = do_sample if do_sample is not None else SamplingParams._do_sample
+        self.presence_penalty = presence_penalty if presence_penalty is not None else SamplingParams._presence_penalty
+        self.frequency_penalty = (
+            frequency_penalty if frequency_penalty is not None else SamplingParams._frequency_penalty
+        )
+        self.repetition_penalty = (
+            repetition_penalty if repetition_penalty is not None else SamplingParams._repetition_penalty
+        )
+        self.exponential_decay_length_penalty = exponential_decay_length_penalty
+        self.temperature = temperature if temperature is not None else SamplingParams._temperature
+        self.top_p = top_p if top_p is not None else SamplingParams._top_p
+        self.top_k = top_k if top_k is not None else SamplingParams._top_k
+        self.ignore_eos = ignore_eos
+        self.image_max_patch_num = image_max_patch_num
+        self.max_new_tokens = max_new_tokens
+        self.min_new_tokens = min_new_tokens
+        self.stop_sequences = stop_sequences if stop_sequences is not None else SamplingParams._stop_sequences
+        self.stop_str_match_mode = StopStrMatchMode(stop_str_match_mode)
+        self.include_stop_str_in_output = include_stop_str_in_output
+        # 运行时状态由 StopStrMatchBuffer 维护，此参数仅用于初始化。
+        self._initial_reasoning_state = _initial_reasoning_state
+        self.skip_special_tokens = skip_special_tokens
+        self.add_special_tokens = add_special_tokens
+        self.add_spaces_between_special_tokens = add_spaces_between_special_tokens
+        self.print_eos_token = print_eos_token
+        self.regular_constraint = regular_constraint
+        self.guided_grammar = guided_grammar
+        self.guided_json = guided_json
+        self.guided_reasoning_end = guided_reasoning_end
+        self.pd_previous_output_len = pd_previous_output_len
+        self.invalid_token_ids = invalid_token_ids
+        self.group_request_id = group_request_id
+        self.suggested_dp_index = suggested_dp_index
+        self.seed = self._normalize_and_verify_seed(seed)
+        if self.do_sample is False:
+            self.temperature = 1.0
+            self.top_p = 1.0
+            self.top_k = 1
+        if (
+            self.temperature >= 0.0 and self.temperature < _SAMPLING_EPS
+        ):  # temperature is too slow, change to greedy search
+            self.temperature = 1.0
+            self.top_k = 1
+        self.input_penalty = input_penalty
+        if self.n is None:
+            self.n = self.best_of
+        return
+
+    @classmethod
+    def load_generation_cfg(cls, weight_dir):
+        try:
+            from transformers import GenerationConfig
+
+            generation_cfg = GenerationConfig.from_pretrained(weight_dir, trust_remote_code=True).to_dict()
+
+            def _cfg(key, default):
+                v = generation_cfg.get(key)
+                return v if v is not None else default
+
+            cls._do_sample = _cfg("do_sample", False)
+            cls._presence_penalty = _cfg("presence_penalty", 0.0)
+            cls._frequency_penalty = _cfg("frequency_penalty", 0.0)
+            cls._repetition_penalty = _cfg("repetition_penalty", 1.0)
+            cls._temperature = _cfg("temperature", 1.0)
+            cls._top_p = _cfg("top_p", 1.0)
+            cls._top_k = _cfg("top_k", -1)
+            cls._stop_sequences = generation_cfg.get("stop", None)
+        except:
+            pass
+
+    def verify(self):
+        if self.best_of <= 0 or self.best_of > MAX_BEST_OF:
+            raise ValueError(f"need 0 < best_of <= {MAX_BEST_OF}, but get {self.best_of}")
+        if self.n != self.best_of:
+            raise ValueError("current only supported n == best_of")
+        if self.n <= 0 or self.n > MAX_BEST_OF or self.n > self.best_of:
+            raise ValueError(f"need 0 < n <= {MAX_BEST_OF}, n <= {self.best_of}, but get {self.n}")
+        if self.presence_penalty < 0.0:
+            raise ValueError(f"presence_penalty must >= 0.0, got {self.presence_penalty}")
+        if self.frequency_penalty < 0.0:
+            raise ValueError(f"frequency_penalty must >= 0.0, got {self.frequency_penalty}")
+        if self.repetition_penalty < 1.0:
+            raise ValueError(f"repetition_penalty must >= 1.0, got {self.repetition_penalty}")
+        if self.temperature <= 0.0:
+            raise ValueError(f"temperature must > 0.0, got {self.temperature}")
+        if self.top_p <= 0.0 or self.top_p > 1.0:
+            raise ValueError(f"top_p must in (0.0, 1.0], got {self.top_p}")
+        if self.top_k < -1 or self.top_k == 0:
+            raise ValueError(f"top_k must be -1 (disable), or at least 1, got {self.top_k}.")
+        if self.max_new_tokens < 1:
+            raise ValueError(f"max_new_tokens must be at least 1, got {self.max_new_tokens}.")
+        if self.min_new_tokens < 1:
+            raise ValueError(f"min_new_tokens must be at least 1, got {self.min_new_tokens}.")
+        if self.min_new_tokens > self.max_new_tokens:
+            raise ValueError(
+                f"min_new_tokens must <= max_new_tokens, but got min {self.min_new_tokens}, max {self.max_new_tokens}."
+            )
+        if len(self.exponential_decay_length_penalty) != 2:
+            raise ValueError(
+                f"exponential_decay_length_penalty must be a tuple of (int, float), \
+                got {self.exponential_decay_length_penalty}."
+            )
+        if (
+            not isinstance(self.exponential_decay_length_penalty[0], int)
+            or self.exponential_decay_length_penalty[0] < 0
+        ):
+            raise ValueError(
+                f"exponential_decay_length_penalty[0] must be a non-negative integer, \
+                got {self.exponential_decay_length_penalty[0]}."
+            )
+        if (
+            not isinstance(self.exponential_decay_length_penalty[1], float)
+            or self.exponential_decay_length_penalty[1] < 1.0
+        ):
+            raise ValueError(
+                f"exponential_decay_length_penalty[1] must be a float >= 1.0, \
+                got {self.exponential_decay_length_penalty[1]}."
+            )
+        if self.regular_constraint is not None and not isinstance(self.regular_constraint, str):
+            raise ValueError(
+                f"regular_expression must be str type, \
+                              but get {str(self.regular_constraint)}"
+            )
+
+        if self.regular_constraint is not None:
+            # check regex format
+            try:
+                validate_grammar("regex", self.regular_constraint)
+            except Exception as e:
+                raise ValueError(f"regular_expression '{self.regular_constraint}' has parse_pattern_error: {str(e)}")
+
+        if not (self.group_request_id is None or isinstance(self.group_request_id, int)):
+            raise ValueError(f"group_request_id must be None or int ,but get {self.group_request_id}")
+
+        if not (self.suggested_dp_index is None or isinstance(self.suggested_dp_index, int)):
+            raise ValueError(f"suggested_dp_index must be None or int, but get {self.suggested_dp_index}")
+
+        self._verify_stop_sentences()
+
+        return
+
+    @staticmethod
+    def _normalize_and_verify_seed(seed: Optional[int]) -> int:
+        seed = -1 if seed is None else seed
+        if not -1 <= seed <= MAX_SEED:
+            raise ValueError(f"seed must be -1 (random), or an integer in [0, {MAX_SEED}], got {seed}")
+        return seed
+
+    def _verify_stop_sentences(self):
+        if self.stop_sequences is not None:
+            if isinstance(self.stop_sequences, str):
+                return
+            if isinstance(self.stop_sequences, list):
+                if all(
+                    isinstance(stop_info, str)
+                    or (isinstance(stop_info, list) and all(isinstance(x, int) for x in stop_info))
+                    for stop_info in self.stop_sequences
+                ):
+                    return
+            raise ValueError("stop_sequences only support str or a list of strings and token ID lists")
+
+    def to_dict(self):
+        ret = {}
+        ret["do_sample"] = self.do_sample
+        ret["presence_penalty"] = self.presence_penalty
+        ret["frequency_penalty"] = self.frequency_penalty
+        ret["repetition_penalty"] = self.repetition_penalty
+        ret["exponential_decay_length_penalty"] = self.exponential_decay_length_penalty
+        ret["temperature"] = self.temperature
+        ret["top_p"] = self.top_p
+        ret["top_k"] = self.top_k
+        ret["image_max_patch_num"] = self.image_max_patch_num
+        ret["min_new_tokens"] = self.min_new_tokens
+        ret["ignore_eos"] = self.ignore_eos
+        ret["max_new_tokens"] = self.max_new_tokens
+        ret["stop_sequences"] = self.stop_sequences
+        ret["stop_str_match_mode"] = self.stop_str_match_mode.get_mode()
+        ret["include_stop_str_in_output"] = self.include_stop_str_in_output
+        ret["_initial_reasoning_state"] = self._initial_reasoning_state
+        ret["best_of"] = self.best_of
+        ret["input_penalty"] = self.input_penalty
+        ret["regular_constraint"] = self.regular_constraint
+        ret["guided_grammar"] = self.guided_grammar
+        ret["guided_json"] = self.guided_json
+        ret["guided_reasoning_end"] = self.guided_reasoning_end
+        ret["pd_previous_output_len"] = self.pd_previous_output_len
+        ret["invalid_token_ids"] = self.invalid_token_ids
+        ret["seed"] = self.seed
+        return ret
+
+    def to_origin_dict(self):
+        ret = self.to_dict()
+        ret["group_request_id"] = self.group_request_id
+        ret["suggested_dp_index"] = self.suggested_dp_index
+        return ret
+
+    def to_string(self):
+        output_str = ""
+        for name, value in vars(self).items():
+            output_str += f"{name}: {value} "
+        return output_str

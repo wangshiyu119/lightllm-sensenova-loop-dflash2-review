@@ -1,0 +1,894 @@
+.. _tutorial/api_server_args:
+
+APIServer Parameter Details
+===========================
+
+This document provides detailed information about all startup parameters and their usage for LightLLM APIServer.
+
+Vocabulary Parallel Sampling
+----------------------------
+
+.. option:: --target_vocab_topk_sampling {2,8,16,32,64,128,256,512}
+
+    Candidate count communicated by each TP rank for target-model logits. The default ``None`` disables candidate communication.
+
+.. option:: --draft_vocab_topk_sampling {2,8,16,32,64,128,256,512}
+
+    Output candidate count from each TP rank for the draft model. The default ``None`` disables candidate output.
+    The two options independently control the target-model and draft-model output widths.
+    When unset, the corresponding model retains full-vocabulary logits communication and sampling.
+    When set, every TP rank selects local candidates, then one all-gather returns the logits and global
+    token IDs from all TP ranks. The settings also apply at TP=1.
+
+    Fixed-step draft decoding takes argmax over the candidates. The result remains the exact
+    full-vocabulary argmax because every shard contributes its local maximum. Dynamic MTP applies
+    softmax over the gathered candidates to produce simulated scheduling confidence; this is not
+    a full-vocabulary probability and can change dynamic step selection.
+
+    The target model selects the configured candidate count from each TP vocabulary shard before temperature,
+    request top-k, and top-p processing. The output layer then creates full-vocabulary logits, fills
+    non-candidate positions with ``-10000000.0``, and scatters candidate values by global token ID.
+    Downstream code continues through the existing full-vocabulary sampling path without a candidate-ID
+    mapping; existing penalties and invalid-token masking still run after candidate reconstruction.
+    A request top-k of -1 or larger than the gathered candidate count still only covers the candidates.
+    Generated-token logprobs and top-p mass
+    are relative to the candidate set, so enabling target candidates explicitly opts into approximate sampling.
+
+    Features that depend on the original scores of non-candidate tokens cannot recover exact full-vocabulary
+    results. Examples include the complete token ranks required by ``--enable_rl`` or a large logit bias that
+    would have promoted a non-candidate token into the selected set.
+    ``--target_vocab_topk_sampling`` requires ``--output_constraint_mode none``;
+    combining it with ``xgrammar`` causes a startup error.
+    This check does not restrict ``--draft_vocab_topk_sampling``.
+    Use matching settings on PD master, prefill, and decode services.
+
+    Output layers must use the standard Llama ``token_forward``, ``_token_forward``, and
+    ``_lm_head_and_gather`` implementations; normalization overrides are allowed.
+    Model initialization no longer checks output-layer compatibility.
+    Leave the corresponding candidate option unset for nonstandard output heads.
+
+Basic Configuration Parameters
+------------------------------
+
+.. option:: --run_mode
+
+    Set the running mode, optional values:
+    
+    * ``normal``: Single server mode (default)
+    * ``prefill``: Prefill mode (for pd disaggregation running mode)
+    * ``decode``: Decode mode (for pd disaggregation running mode)
+    * ``pd_master``: pd master node mode (for pd disaggregation running mode)
+    * ``config_server``: Configuration server mode (for pd disaggregation mode, used to register pd_master nodes and get pd_master node list), specifically designed for large-scale, high-concurrency scenarios, used when `pd_master` encounters significant CPU bottlenecks.
+
+.. option:: --performance_mode, --p_mode
+
+    Performance mode for different scenarios, optional values:
+    
+    * ``None``: No performance mode applied (default)
+    * ``personal``: Private personal running mode, automatically sets:
+        - ``running_max_req_size`` to 3
+        - ``batch_max_tokens`` to 2048 (2k)
+        - ``chunked_prefill_size`` to 1024 (1k)
+
+.. option:: --host
+
+    Server listening address, default is ``127.0.0.1``
+
+.. option:: --port
+
+    Server listening port, default is ``8000``
+
+.. option:: --httpserver_workers
+
+    HTTP server worker process count, default is ``1``.
+    With ``--run_mode pd_master``, a value greater than ``1`` starts independent PD master workers
+    behind one HAProxy HTTP/SSE entry point. The launcher assigns all internal worker ports before
+    starting the workers and starts a shared request ID service.
+    P/D nodes point ``--pd_master_ip`` and ``--pd_master_port`` at the public entry point,
+    read the worker ports through ``/get_server_info``, and use each port as its node ID when connecting.
+    The multiprocess master itself does not accept external config server parameters.
+    This mode requires HAProxy.
+    See :ref:`tutorial/pd_master_multiprocess_en`.
+
+.. option:: --disable_delay_response_start
+
+    Send the status and headers of a streaming response immediately instead of waiting until the first response
+    chunk is ready. By default, LightLLM delays the response start so errors raised before the first chunk can still
+    be returned with the appropriate HTTP status code.
+
+.. option:: --hypercorn_config
+
+    Path to a Hypercorn TOML configuration file. Only TOML configuration files are supported.
+    See ``test/hypercorn_config.toml`` for an example. Default: ``None``. The bind address and HTTP worker
+    count explicitly set by LightLLM override the corresponding values in the configuration file.
+
+.. option:: --zmq_mode
+
+    ZMQ communication mode, optional values:
+    
+    * ``tcp://``: TCP mode
+    * ``ipc:///tmp/``: IPC mode (default)
+    
+    Can only choose from ``['tcp://', 'ipc:///tmp/']``
+
+PD disaggregation Mode Parameters
+----------------------------------
+
+.. option:: --pd_master_ip
+
+    PD master node IP address, default is ``0.0.0.0``
+    
+    In prefill or decode mode without config server settings, query ``/get_server_info`` at this
+    address and read ``pd_master_multi_ports``. Multiprocess mode uses each port as the corresponding
+    worker's ``pd_node_id``.
+
+.. option:: --pd_master_port
+
+    PD master node port, default is ``1212``
+    
+    In prefill or decode mode without config server settings, use this master port. Single-worker
+    mode connects using the returned ``pd_node_id``; multiprocess mode connects directly to every
+    returned worker port.
+
+.. option:: --pd_master_mode
+
+    PD master topology mode, optional values:
+
+    * ``elastic``: The number of Prefill and Decode nodes can change dynamically (default)
+    * ``<P>p<D>d``: The numbers of Prefill and Decode nodes are fixed. For example,
+      ``2p4d`` expects exactly 2 Prefill nodes and 4 Decode nodes.
+
+    This parameter is used when ``run_mode`` is set to ``pd_master``.
+    In ``elastic`` mode, PD Master becomes ready after at least one Prefill and one Decode node are registered;
+    additional nodes do not make it unready. In a fixed mode, PD Master is ready only when the registered node
+    counts exactly match the configured topology. ``/health``, ``/healthz``, and ``/readiness`` return HTTP 503
+    while the nodes are not ready. In a fixed topology mode, PD Master also requests ``/health`` concurrently
+    from every connected Prefill and Decode node. A failed or timed-out request, or any response other than
+    HTTP 200, makes the PD Master health endpoints return HTTP 503. Independently of the topology mode,
+    PD Master also applies the regular inference-progress health check: while requests remain in flight,
+    the endpoints return HTTP 503 if no request on the PD Master successfully returns a token for
+    ``HEALTH_TIMEOUT`` consecutive seconds.
+
+.. option:: --disable_pd_node_self_request_limit
+
+    P/D-node resource wait limiting is enabled by default and managed centrally by PD Master. Set this option only
+    when disabling the feature, and only when starting PD Master; it is not needed on Prefill or Decode nodes.
+    By default, PD Master supplies
+    ``pd_node_resource_wait_timeout_seconds`` for every request. P/D nodes only enforce the received value for local
+    ``shm_req`` allocation and the wait from Router entry to inference entry; they do not read local limiting switches
+    or timeout settings. The first segment's timeout is
+    controlled on PD Master by ``LIGHTLLM_PD_NODE_RESOURCE_WAIT_TIMEOUT_SECONDS`` and defaults to 10 seconds; set it
+    to -1 to wait indefinitely. Continuation segments with ``segment_index > 0`` use a separate timeout controlled by
+    ``LIGHTLLM_PD_NODE_CONTINUATION_RESOURCE_WAIT_TIMEOUT_SECONDS`` and defaults to 60 seconds, improving the chance
+    that requests which have already produced partial results complete successfully. When set to a non-negative value,
+    a timeout reports ``Server is busy``; a request that has
+    entered the Router but not inference is proactively marked aborted, and PD Master converts this to HTTP 429.
+    While this feature is enabled, PD Master returns ``Server is busy`` without retrying by default.
+    ``LIGHTLLM_PD_NODE_BUSY_RETRY_TIMEOUT_SECONDS`` controls the maximum retry probing period and defaults to ``0``;
+    set it to a positive value to make PD Master select P/D nodes again and retry within that period. Once response
+    tokens have been streamed to the client, the request is not restarted even when a positive timeout is configured,
+    because doing so would duplicate output. With ``--disable_pd_node_self_request_limit``, PD Master no longer supplies a finite
+    resource wait timeout; all P/D nodes wait indefinitely, and a ``Server is busy`` raised for another reason is
+    returned immediately without retrying.
+    In multi-node TP deployments, only the master node evaluates the timeout; slave nodes wait indefinitely.
+    The maximum cache-record age eligible for promotion is controlled by
+    ``LIGHTLLM_PD_CACHE_HIGH_PRIORITY_MAX_AGE_SECONDS`` and defaults to
+    36 seconds. Cache-hit promotion also requires at least the number of input tokens configured by
+    ``LIGHTLLM_PD_CACHE_HIGH_PRIORITY_MIN_PROMPT_TOKENS`` (4096 by default), so short requests do not gain priority
+    solely from a high cache-hit rate.
+
+    The following example explicitly enables busy retries for up to 120 seconds:
+
+    .. code-block:: bash
+
+        LIGHTLLM_PD_NODE_RESOURCE_WAIT_TIMEOUT_SECONDS=10 \
+            LIGHTLLM_PD_NODE_CONTINUATION_RESOURCE_WAIT_TIMEOUT_SECONDS=60 \
+            LIGHTLLM_PD_NODE_BUSY_RETRY_TIMEOUT_SECONDS=120 \
+            python -m lightllm.server.api_server --run_mode pd_master ...
+
+.. option:: --disable_pd_cache_high_priority
+
+    Disable PD Master from promoting sufficiently long first-segment requests whose estimated input cache hit rate
+    is high and whose cache record is still fresh. This does not affect segmented continuation requests after PD
+    Decode capacity exhaustion; continuation requests remain high priority. Disabled by default, so eligible requests
+    are promoted unless this option is set.
+
+    Configure this option only on PD Master. When a Prefill node's combined GPU, CPU, and disk cache capacity is small
+    relative to its request working set, later requests can quickly evict reusable cache entries under high load.
+    Requests that could otherwise hit the cache must then repeat Prefill computation, which can significantly reduce
+    Prefill efficiency. In this situation, keep the default high-priority policy enabled so requests with a high
+    estimated cache hit rate can run earlier and reuse their cache entries before eviction.
+
+    This policy changes queue ordering and may increase time to first token (TTFT) for ordinary requests that do not
+    meet the cache-hit-rate, cache-age, or minimum-prompt-token thresholds. Consider setting
+    ``--disable_pd_cache_high_priority`` when Prefill cache capacity is sufficient and cache churn is low, or when
+    scheduling fairness and ordinary-request TTFT are more important than preserving cache-hit efficiency.
+
+.. option:: --config_server_host
+
+    Host address in configuration server mode
+
+.. option:: --config_server_port
+
+    Port number in configuration server mode
+
+Model Configuration Parameters
+------------------------------
+
+.. option:: --model_name
+
+    Model name, used to distinguish internal model names, default is ``default_model_name``
+    
+    Can be obtained via ``host:port/get_model_name``
+
+.. option:: --model_dir
+
+    Model weight directory path, the application will load configuration, weights, and tokenizer from this directory
+
+.. option:: --tokenizer_mode
+
+    Tokenizer loading mode, optional values:
+    
+    * ``slow``: Slow mode, loads fast but runs slow, suitable for debugging and testing
+    * ``fast``: Fast mode (default), achieves best performance
+    * ``auto``: Auto mode, tries to use fast mode, falls back to slow mode if it fails
+
+.. option:: --load_way
+
+    Model weight loading method, default is ``HF`` (Huggingface format)
+    
+    Llama models also support ``DS`` (Deepspeed) format
+
+.. option:: --trust_remote_code
+
+    Whether to allow using custom model definition files on Hub
+
+Memory and Batch Processing Parameters
+---------------------------------------
+
+.. option:: --max_total_token_num
+
+    Total token number of kv cache. 
+    
+    If not specified, will be automatically calculated based on mem_fraction
+
+.. option:: --mem_fraction
+
+    Memory usage ratio, default is ``0.9``
+    
+    If OOM occurs during runtime, you can specify a smaller value
+
+.. option:: --batch_max_tokens
+
+    Maximum token count for new batches, controls prefill batch size to prevent OOM
+
+.. option:: --running_max_req_size
+
+    Total shared request slots on the local node, default is ``256``.
+    DP mode allocates ``ceil(running_max_req_size / local DP rank count)``
+    request-state slots per rank, which also limits scheduling concurrency and CUDA Graph batches.
+    Diverse mode and DP prompt cache fetch keep the original capacity.
+
+.. option:: --max_req_total_len
+
+    Maximum value of request input length + request output length. If not set, it will be
+    automatically derived from model config.json and fall back to ``16384`` if derivation fails.
+    For some RoPE types (like ``yarn/dynamic/su/llama3``), the derivation does not multiply
+    ``rope_scaling.factor`` by ``max_position_embeddings`` to avoid over-estimating the max length.
+
+.. option:: --eos_id
+
+    End stop token ID, can specify multiple values. If None, will be loaded from config.json
+
+.. option:: --tool_call_parser
+
+    OpenAI interface tool call parser type, optional values:
+    
+    * ``qwen25``
+    * ``llama3``
+    * ``mistral``
+
+Different Parallel Mode Setting Parameters
+-------------------------------------------
+
+.. option:: --nnodes
+
+    Number of nodes, default is ``1``
+
+.. option:: --node_rank
+
+    Current node rank, default is ``0``
+
+.. option:: --multinode_httpmanager_port
+
+    Multi-node HTTP manager port, default is ``12345``
+
+.. option:: --multinode_router_gloo_port
+
+    Multi-node router gloo port, default is ``20001``
+
+.. option:: --tp
+
+    Model tensor parallelism size, default is ``1``
+
+.. option:: --dp
+
+    Data parallelism size, default is ``1``
+    
+    This is a useful parameter for deepseekv2. When using deepseekv2 model, set dp equal to the tp parameter.
+    In other cases, please do not set it, keep the default value of 1.
+
+.. option:: --nccl_host
+
+    nccl_host used to build PyTorch distributed environment, default is ``127.0.0.1``
+    
+    For multi-node deployment, should be set to the master node's IP
+
+.. option:: --nccl_port
+
+    nccl_port used to build PyTorch distributed environment, default is ``28765``
+
+.. option:: --use_config_server_to_init_nccl
+
+    Use tcp store server started by config_server to initialize nccl, default is False
+    
+    When set to True, --nccl_host must equal config_server_host, --nccl_port must be unique for config_server,
+    do not use the same nccl_port for different inference nodes, this will be a serious error
+
+Scheduling Parameters
+---------------------
+
+.. option:: --router_token_ratio
+
+    Threshold for determining if the service is busy, default is ``0.0``. Once the kv cache usage exceeds this value, it will directly switch to conservative scheduling.
+
+.. option:: --router_max_wait_tokens
+
+    Trigger scheduling of new requests every router_max_wait_tokens decoding steps, default is ``6``
+
+.. option:: --disable_aggressive_schedule
+
+    Disable aggressive scheduling
+    
+    Aggressive scheduling may cause frequent prefill interruptions during decoding. Disabling it can make the router_max_wait_tokens parameter work more effectively.
+
+.. option:: --enable_prefill_decode_mixed
+
+    Enable mixed prefill and decode scheduling in the same inference step.
+
+    Only supported when ``--run_mode`` is ``normal``. When both prefill and decode requests are pending,
+    the scheduler runs prefill first and then decode in one scheduling step, instead of running only
+    prefill under aggressive scheduling. This improves decode throughput when new prefill requests arrive.
+
+    Cannot be used together with ``--enable_prefill_microbatch_overlap`` or
+    ``--enable_decode_microbatch_overlap``.
+
+.. option:: --disable_dynamic_prompt_cache
+
+    Disable kv cache caching
+
+.. option:: --chunked_prefill_size
+
+    Chunked prefill size, default is ``4096``
+
+.. option:: --disable_chunked_prefill
+
+    Whether to disable chunked prefill
+
+.. option:: --disable_chunked_mm_input
+
+    Enabled automatically for Neo, DeepSeek-V4 and Gemma4; opt-in for other models.
+    Process each image/audio token block within one prefill step,
+    while text can still be chunked. A complete block may exceed ``chunked_prefill_size``
+    but must fit ``batch_max_tokens``. With vision enabled, startup requires
+    ``batch_max_tokens >= max_image_token_count``.
+    GPU, CPU and disk cache restore points stay outside multimodal blocks.
+
+.. option:: --prefill_queue_strategy
+
+    Prefill ordering policy in the inference backend before resource allocation. Defaults
+    to ``auto`` (automatic selection by run mode). The policy first moves pause-pending, paused, finished, aborted,
+    or cleanup-marked requests to the end in arrival order. It then identifies active decode requests,
+    keeps them at the left in arrival order, and excludes them from subsequent sorting. ``infer_high_priority`` and
+    the selected policy apply only to the prefill requests on the right.
+
+    Prefill requests carry an internal ``infer_high_priority`` field. It defaults to ``0``,
+    cannot be set by external requests, and is assigned a negative value to continuation
+    segments through internal PD-disaggregation communication.
+
+    * ``auto``: select the policy automatically based on ``--run_mode``:
+      use ``default`` for standalone normal mode (``normal``) and Decode nodes (``decode``),
+      and ``hrrn`` for Prefill nodes (``prefill``). Omitting this option is equivalent to
+      setting ``auto``. Explicitly selecting one of the policies
+      below overrides automatic selection.
+    * ``default``: stably sort by ``infer_high_priority`` from smallest to largest and preserve
+      FCFS order within the same value.
+    * ``promote_shortest``: keep negative-priority prefill requests first in arrival order.
+      Among non-negative-priority normal requests, move only the request with the fewest
+      remaining prefill tokens to the front of the normal queue. Preserve the relative order
+      of all other normal requests. Fully processed prompts of unfinished requests count as zero. This mode is mainly
+      intended for Prefill nodes in PD-disaggregated deployments to improve TTFT for some short
+      requests.
+    * ``hrrn``: keep negative-priority prefill requests first, then order normal requests with
+      token-based Highest Response Ratio Next. Aging starts when a normal request first participates in HRRN ordering.
+      The response ratio uses the number of prefill
+      tokens processed while a request has waited and the uncached prefill tokens captured when it first
+      participates in HRRN ordering.
+      It favors short requests while gradually aging long-waiting requests to prevent starvation.
+      This mode is intended for Prefill nodes in PD-disaggregated deployments with highly varied
+      request lengths. This strategy is based on
+      `SGLang PR #32911 <https://github.com/sgl-project/sglang/pull/32911>`_; thanks to its authors
+      and the SGLang community for sharing their work.
+
+    For example, append ``--prefill_queue_strategy hrrn`` to your launch command.
+    Compare TTFT, TPOT, and tail latency under representative traffic before choosing a
+    policy; changing policies does not guarantee an SLA improvement.
+
+    To extend, subclass ``PrefillQueueStrategy`` in
+    ``lightllm/server/router/model_infer/mode_backend/prefill_queue_strategy``, implement
+    ``reorder_prefill``, and
+    add the class to ``PREFILL_QUEUE_STRATEGIES``. Update the CLI and ``StartArgs`` choices to expose its name.
+    Implementations must preserve the request set, request state, and input list, and
+    produce deterministic ordering across TP ranks. Each strategy receives the current
+    ``ModeBackend`` instance and can read scheduling state through ``self.backend``.
+
+.. option:: --diverse_mode
+
+    Multi-result output mode
+
+.. option:: --schedule_time_interval
+
+    Schedule time interval, default is ``0.03``, unit is seconds
+
+Output Constraint Parameters
+----------------------------
+
+.. option:: --output_constraint_mode
+
+    Set the output constraint backend, optional values:
+    
+    * ``xgrammar``: Default; enabled per request, supporting JSON Schema, JSON objects, EBNF, and regex
+    * ``none``: Disable the output constraint backend
+
+    Supports TP/DP, MTP, and microbatch overlap. The Outlines backend has been removed;
+    ``regular_constraint`` uses XGrammar regex syntax.
+
+    ChatCompletion JSON Schema / JSON object constraints apply after thinking ends,
+    as indicated by the configured reasoning parser's closing marker.
+    With thinking disabled, constraints apply from the first output token.
+
+.. option:: --grammar_compile_timeout
+
+    HTTP grammar compilation wait timeout in seconds. Defaults to ``30.0`` and must be positive.
+    Invalid grammars, compilation failures, or timeouts return HTTP 400 before inference or streaming starts.
+
+Multimodal Parameters
+---------------------
+
+.. option:: --disable_vision
+
+    If the model is a multimodal model, set this to not load the vision part model (default is None, auto-detected based on model)
+
+.. option:: --disable_audio
+
+    If the model is a multimodal model, set this to not load the audio part model (default is None, auto-detected based on model)
+
+.. option:: --enable_multimodal_url_cache
+
+    Cache image, video, and audio URL content in the local process to avoid repeated downloads. Disabled by default. The maximum number of cached resources defaults to ``512`` and can be configured with ``LIGHTLLM_URL_POOL_MAXSIZE``.
+
+.. option:: --enable_mps
+
+    Whether to enable nvidia mps for multimodal services
+
+.. option:: --cache_capacity
+
+    Cache server capacity for multimodal resources, default is ``200``
+
+.. option:: --max_image_token_count
+
+    Maximum allowed token count for a single image after tokenization, default is ``6128``
+
+    Requests are rejected when any image exceeds this limit.
+
+.. option:: --max_image_pixels
+
+    Maximum allowed pixel count for a single image before preprocessing resize, default is ``8294400`` (about 4K image pixels).
+
+    If an input image exceeds this threshold, LightLLM automatically resizes it down to this pixel budget before continuing.
+
+    In multimodal PD disaggregation mode, PD Master and every Prefill node must use the same value; otherwise Prefill registration is rejected.
+
+.. option:: --disable_image_resize
+
+    Disable automatic resize for images exceeding ``--max_image_pixels``. Resize is enabled by default.
+
+    In multimodal PD disaggregation mode, PD Master and every Prefill node must use the same value.
+
+.. option:: --visual_infer_batch_size
+
+    Number of images processed in each inference batch, default is ``1``
+
+.. option:: --visual_gpu_ids
+
+    List of GPU IDs to use, e.g., 0 1 2
+
+.. option:: --visual_tp
+
+    Number of tensor parallel instances for ViT, default is ``1``
+
+.. option:: --visual_dp
+
+    Number of data parallel instances for ViT, default is ``1``
+
+.. option:: --vit_att_backend
+
+    Set the attention backend for ViT. Available options:
+
+    * ``auto``: Automatically select the best backend (default), with priority fa3 > xformers > sdpa > triton
+    * ``fa3``: Use Flash-Attention 3 backend
+    * ``xformers``: Use xformers backend
+    * ``sdpa``: Use sdpa backend
+    * ``triton``: Use Triton backend
+
+
+Performance Optimization Parameters
+-----------------------------------
+
+.. option:: --disable_symm_mem_allreduce
+
+    Disable the default SymmMem all-reduce fast path and fall back to NCCL
+
+.. option:: --disable_flashinfer_allreduce
+
+    Disable the default FlashInfer all-reduce fast path and fall back to SymmMem / NCCL
+
+.. option:: --enable_tpsp_mix_mode
+
+    The inference backend will use TP SP mixed running mode
+    
+    Currently only supports llama and deepseek series models
+
+.. option:: --enable_prefill_microbatch_overlap
+
+    The inference backend will use microbatch overlap mode for prefill
+    
+    Currently only supports deepseek series.
+
+.. option:: --enable_decode_microbatch_overlap
+
+    The inference backend will use microbatch overlap mode for decoding
+
+.. option:: --llm_prefill_att_backend
+
+    Set the attention backend for the prefill phase. For hybrid linear-attention models such as Qwen3.5,
+    the first value selects the full-attention backend and the optional second value selects the
+    linear-attention backend. If the second value is omitted, it defaults to ``auto``.
+
+    Full-attention options:
+
+    * ``auto``: Automatically select the best backend (default), with priority fa3 > flashinfer > triton
+    * ``fa3``: Use Flash-Attention 3 backend
+    * ``flashinfer``: Use FlashInfer backend
+    * ``triton``: Use Triton backend
+
+    Linear-attention options for Qwen3.5:
+
+    * ``auto``: Automatically select the best backend (default), with priority flashqla > triton
+    * ``flashqla``: Use FlashQLA backend
+    * ``triton``: Use Triton backend
+
+    Example: ``--llm_prefill_att_backend fa3 flashqla``.
+
+    Linear-attention options for GLM-5.3-Flash:
+
+    * ``auto`` (default): On Hopper with BF16 computation and BF16 recurrent state, use FlashKDA
+      when installed and compatible. Select it for query chunks up to 8192 tokens with at least
+      16 local KDA heads, or up to 2048 tokens with fewer heads. The longest query chunk in the
+      batch determines selection, before Q/K normalization. Other cases use Triton.
+      These conservative limits reflect measured H100/H200 performance; explicit selection
+      can override them for other workloads.
+    * ``triton``: Always use Triton, without importing FlashKDA.
+    * ``flashkda``: Use the optional FlashKDA prefill kernel, in both native and replay SSM modes.
+      The FlashKDA installation must support the current GPU and model inputs. Explicit selection
+      bypasses the automatic length policy; decode and MTP verification continue to use the selected
+      SSM mode's existing kernels.
+
+    Install FlashKDA with CUDA 12.9 or newer:
+
+    .. code-block:: bash
+
+        pip install --no-build-isolation git+https://github.com/MoonshotAI/FlashKDA.git
+
+    Select it with ``--llm_prefill_att_backend auto flashkda``. A missing or unloadable optional
+    package falls back to Triton in ``auto`` mode, and reports an installation error in explicit mode.
+    FlashKDA uses BF16 internal recurrent updates even with FP32 state storage.
+    Automatic selection therefore keeps FP32 state configurations on Triton.
+    Use explicit ``triton`` when FP32 recurrent computation is required.
+
+    ``--llm_kv_type fp8kv_dsa`` independently controls the sparse-attention layers and can be used
+    with FlashKDA. It does not quantize KDA inputs or recurrent state to FP8. KDA's persistent
+    state layout is unchanged for decode, MTP, prefix-cache restore and PD transfer.
+
+.. option:: --llm_decode_att_backend
+
+    Set the attention backend for the decode phase. For hybrid linear-attention models such as Qwen3.5,
+    the first value selects the full-attention backend and the optional second value selects the
+    linear-attention backend. If the second value is omitted, it defaults to ``auto``.
+
+    Full-attention options:
+
+    * ``auto``: Automatically select the best backend (default), with priority fa3 > flashinfer > triton
+    * ``fa3``: Use Flash-Attention 3 backend
+    * ``flashinfer``: Use FlashInfer backend
+    * ``triton``: Use Triton backend
+
+    Linear-attention options for Qwen3.5:
+
+    * ``auto``: Automatically select the best backend (default; currently selects triton)
+    * ``triton``: Use Triton backend
+
+    Example: ``--llm_decode_att_backend flashinfer triton``.
+
+.. option:: --llm_kv_type
+
+    Set the KV cache data type for inference. Available options:
+
+    * ``None``: Use the dtype from model's config.json
+    * ``int8kv``: INT8 KV quantization
+    * ``int4kv``: INT4 KV quantization
+    * ``fp8kv_sph``: FP8 static per-head quantization, uses fa3 backend
+    * ``fp8kv_spt``: FP8 static per-tensor quantization, uses flashinfer backend
+
+.. option:: --linear_att_hash_page_size
+
+    Hash page size for linear attention, default is ``512``.
+
+    This controls the number of tokens per hash bucket, which can affect radix cache reuse.
+
+.. option:: --linear_att_page_block_num
+
+    Number of blocks used for linear-attention state storage, default is ``10000000``.
+
+    This controls the available pages for attention state data, which can affect memory usage and multi-turn chat performance.
+    In current behavior, block size can be approximated as
+    ``linear_att_page_block_num * linear_att_hash_page_size``.
+    When ``linear_att_page_block_num * linear_att_hash_page_size > max_req_total_len``,
+    block-level matching in radix cache is effectively disabled, and request-level small-page matching
+    (small page size is ``linear_att_hash_page_size``) becomes dominant.
+    Under high load, limited small-page capacity plus internal LRU eviction can reduce cache hit rate.
+
+    When ``--enable_cpu_cache`` is enabled, CPU cache page size is forced to
+    ``linear_att_page_block_num * linear_att_hash_page_size`` to satisfy internal reuse constraints.
+
+.. option:: --linear_att_cache_size
+
+    Size of linear-attention cache.
+
+    If not specified, it will be automatically derived from cache-related settings.
+    If small-page cache hits are poor under high load (for example, due to limited small-page count and LRU eviction),
+    increasing this value can improve cache hit rate, at the cost of more memory usage.
+
+.. option:: --linear_att_ssm_data_type
+
+    Data type of linear-attention SSM state, optional values:
+
+    * ``bfloat16``
+    * ``float32`` (default)
+
+.. option:: --disable_cudagraph
+
+    Disable cudagraph in the decoding phase
+
+.. option:: --graph_max_batch_size
+
+    Maximum batch size that can be captured by cuda graph in the decoding phase, default is ``256``
+
+.. option:: --graph_split_batch_size
+
+    Controls the interval for generating CUDA graphs during decoding, default is ``32``
+    
+    For values from 1 to the specified graph_split_batch_size, CUDA graphs will be generated continuously.
+    For values from graph_split_batch_size to graph_max_batch_size,
+    a new CUDA graph will be generated for every increase of graph_grow_step_size.
+    Properly configuring this parameter can help optimize the performance of CUDA graph execution.
+
+.. option:: --graph_grow_step_size
+
+    For batch_size values from graph_split_batch_size to graph_max_batch_size,
+    a new CUDA graph will be generated for every increase of graph_grow_step_size, default is ``16``
+
+.. option:: --graph_max_len_in_batch
+
+    Maximum sequence length that can be captured by cuda graph in the decoding phase, default is ``max_req_total_len``
+
+Quantization Parameters
+-----------------------
+
+.. option:: --quant_type
+
+    ``W`` denotes weights and ``A`` denotes activations. The available values are listed below.
+
+    .. list-table::
+       :header-rows: 1
+       :widths: 35 45 20
+       :align: left
+
+       * - ``quant_type``
+         - Quantization
+         - Implementation backend
+       * - ``w8a8``
+         - INT8 W8A8; W: per-channel, A: per-token
+         - vLLM
+       * - ``fp8w8a8``
+         - FP8 W8A8; W: per-channel, A: per-token
+         - vLLM
+       * - ``fp8w8a8-pt``
+         - FP8 W8A8; W: per-tensor, A: per-token
+         - Triton
+       * - ``fp8w8a8-b128``
+         - FP8 W8A8; W: per-block 128×128, A: per-token-group 128
+         - Triton
+       * - ``fp8w8a8g128``
+         - FP8 W8A8; W: per-channel, A: per-token-group 128
+         - Triton
+       * - ``fp8w8a8g64``
+         - FP8 W8A8; W: per-channel, A: per-token-group 64
+         - Triton
+       * - ``awq``
+         - INT4 weight-only; group size comes from the checkpoint
+         - vLLM
+       * - ``awq_marlin``
+         - INT4 weight-only; group size comes from the checkpoint
+         - vLLM
+       * - ``none``
+         - No quantization
+         - -
+       * - ``w8a8-vllm``
+         - INT8 W8A8; W: per-channel, A: per-token
+         - vLLM
+       * - ``fp8w8a8-vllm``
+         - FP8 W8A8; W: per-channel, A: per-token
+         - vLLM
+       * - ``fp8w8a8-pt-vllm``
+         - FP8 W8A8; W: per-tensor, A: per-token
+         - vLLM
+       * - ``fp8w8a8-pt-sgl``
+         - FP8 W8A8; W: per-tensor, A: per-token
+         - SGL
+       * - ``fp8w8a8-pt-triton``
+         - FP8 W8A8; W: per-tensor, A: per-token
+         - Triton
+       * - ``fp8w8a8-b128-vllm``
+         - FP8 W8A8; W: per-block 128×128, A: per-token-group 128
+         - vLLM
+       * - ``fp8w8a8-b128-deepgemm``
+         - FP8 W8A8; W: per-block 128×128, A: per-token-group 128
+         - DeepGEMM
+       * - ``fp8w8a8-b128-triton``
+         - FP8 W8A8; W: per-block 128×128, A: per-token-group 128
+         - Triton
+       * - ``fp8w8a8g128-triton``
+         - FP8 W8A8; W: per-channel, A: per-token-group 128
+         - Triton
+       * - ``fp8w8a8g64-triton``
+         - FP8 W8A8; W: per-channel, A: per-token-group 64
+         - Triton
+       * - ``fp4fp8-b32-deepgemm``
+         - FP4/FP8 mixed quantization; fused MoE expert weights only (SM100)
+         - DeepGEMM
+
+.. option:: --quant_cfg
+
+    Path to quantization configuration file. Can be used for mixed quantization.
+    
+    Examples can be found in test/advanced_config/mixed_quantization/llamacls-mix-down.yaml.
+
+.. option:: --expert_dtype
+
+    Expert quantization dtype for EP MoE, optional values:
+
+    * ``fp8``
+    * ``fp4``: SM100 GPUs only
+    * ``None`` (default)
+
+.. option:: --vit_quant_type
+
+    ViT quantization method, optional values:
+
+    * ``w8a8``
+    * ``fp8w8a8``
+    * ``none`` (default)
+
+.. option:: --vit_quant_cfg
+
+    Path to ViT quantization configuration file. Can be used for mixed quantization.
+    
+    Examples can be found in lightllm/common/quantization/configs.
+
+Sampling and Generation Parameters
+----------------------------------
+
+.. option:: --sampling_backend
+
+    Implementation used for sampling, optional values:
+    
+    * ``triton``: Use torch and triton kernel (default)
+    * ``sglang_kernel``: Use sglang_kernel implementation
+
+.. option:: --enable_prompt_logprobs
+
+    Enable prompt top-k logprobs capture
+
+.. option:: --use_reward_model
+
+    Use reward model
+
+.. option:: --use_tgi_api
+
+    Use tgi input and output format
+
+MTP Multi-Prediction Parameters
+-------------------------------
+
+.. option:: --mtp_mode
+
+    Supported mtp modes, it is recommended to use eagle_with_att for better performance, optional values:
+    
+    * ``vanilla_with_att``
+    * ``eagle_with_att``
+    * ``vanilla_no_att``
+    * ``eagle_no_att``
+    * ``None``: Do not enable mtp (default)
+
+.. option:: --mtp_draft_model_dir
+
+    Path to the draft model for MTP multi-prediction functionality
+    
+    Used to load the MTP multi-output token model.
+
+.. option:: --mtp_step
+
+    Specify the number of additional tokens predicted by the draft model, default is ``0``
+    
+    Currently this feature only supports DeepSeekV3/R1 models.
+    Increasing this value allows more predictions, but ensure the model is compatible with the specified number of steps.
+    Currently deepseekv3/r1 models only support 1 step
+
+DeepSeek Redundant Expert Parameters
+------------------------------------
+
+.. option:: --ep_redundancy_expert_config_path
+
+    Path to redundant expert configuration. Can be used for deepseekv3 models.
+
+.. option:: --auto_update_redundancy_expert
+
+    Whether to update redundant experts for deepseekv3 models through online expert usage counters.
+
+Monitoring and Logging Parameters
+---------------------------------
+
+.. option:: --health_monitor
+
+    Check service health status and restart on error
+
+.. option:: --metric_gateway
+
+    Address for collecting monitoring metrics
+
+.. option:: --job_name
+
+    Job name for monitoring, default is ``lightllm``
+
+.. option:: --grouping_key
+
+    Grouping key for monitoring, format is key=value, can specify multiple
+
+.. option:: --push_interval
+
+    Interval for pushing monitoring metrics (seconds), default is ``10``
+
+.. option:: --enable_monitor_auth
+
+    Whether to enable authentication for push_gateway 

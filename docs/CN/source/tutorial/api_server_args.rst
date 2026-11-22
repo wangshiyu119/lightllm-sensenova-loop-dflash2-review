@@ -1,0 +1,833 @@
+.. _tutorial/api_server_args:
+
+APIServer 参数详解
+==================
+
+本文档详细介绍了 LightLLM APIServer 的所有启动参数及其用法。
+
+词表并行采样
+------------
+
+.. option:: --target_vocab_topk_sampling {2,8,16,32,64,128,256,512}
+
+    主模型 target 每个 TP rank 的 logits 通信候选数，默认 ``None``，即关闭候选通信。
+
+.. option:: --draft_vocab_topk_sampling {2,8,16,32,64,128,256,512}
+
+    draft 模型每个 TP rank 的输出候选数，默认 ``None``，即关闭候选输出。
+    两个参数分别控制主模型 target 和 draft 模型的输出候选数。
+    未设置时，对应模型保持完整词表 logits 通信和原采样路径；设置后，每个 TP rank 先选取
+    本地候选，经一次 all-gather 后输出所有 TP rank 的 logits 和全局 token ID。
+    两个参数相互独立，也适用于 TP=1。
+
+    draft 的固定步数路径在候选中取 argmax；由于每个分片的最大值都包含在候选中，最终 token
+    仍是完整词表上的精确 argmax。动态 MTP 在收集到的候选上做 softmax，生成供调度使用的
+    模拟概率；它不是全词表概率，可能改变动态步数选择。模型不计算或输出完整词表 token 概率。
+
+    target 在温度、请求 top-k 和 top-p 处理之前，先从每个 TP 词表分片选取配置数量的候选。
+    输出层随后创建完整词表 logits，将非候选位置填为 ``-10000000.0``，并按全局 token ID
+    回填候选值。下游继续使用原有完整词表采样路径，无需处理候选 token ID 映射；已有的
+    penalty 和 invalid-token 屏蔽仍会在候选回填后执行。请求 top-k=-1 或大于 all-gather 后的
+    候选总数时，仍只能覆盖候选集合。
+    生成 token 的 logprob 是候选集合上的归一化概率对应的对数，不是完整词表上的 logprob；
+    top-p 也不代表完整词表累计概率。启用 target 候选是显式的近似采样。
+
+    依赖非候选原始分数的功能无法恢复完整词表的精确结果，例如 ``--enable_rl`` 所需的完整
+    token rank，或通过较大 logit bias 将非候选 token 提升到候选范围内的场景。
+    启用 ``--target_vocab_topk_sampling`` 时须设置 ``--output_constraint_mode none``；
+    与 ``xgrammar`` 同时启用会在启动时报错。
+    ``--draft_vocab_topk_sampling`` 不受此项检查限制。
+    PD 部署应在 master、prefill 和 decode 上使用相同配置。
+
+    仅支持使用 Llama 标准 ``token_forward``、``_token_forward`` 和 ``_lm_head_and_gather``
+    实现的输出层；允许模型覆盖归一化实现。模型初始化不再检查输出层兼容性，
+    特殊输出层不要设置对应的候选参数。
+
+基础配置参数
+------------
+
+.. option:: --run_mode
+
+    设置运行模式，可选值：
+    
+    * ``normal``: 单服务器模式（默认）
+    * ``prefill``: 预填充模式（用于 pd 分离运行模式）
+    * ``decode``: 解码模式（用于 pd 分离运行模式）
+    * ``pd_master``: pd 主节点模式（用于 pd 分离运行模式）
+    * ``config_server``: 配置服务器模式（用于 pd 分离模式，用于注册 pd_master 节点并获取 pd_master 节点列表）,专门为大规模、高并发场景设计，当 `pd_master` 遇到显著的 CPU 瓶颈时使用。
+
+.. option:: --performance_mode, --p_mode
+
+    不同场景的性能模式，可选值：
+    
+    * ``None``: 不应用性能模式（默认）
+    * ``personal``: 私有化个人运行模式，自动设置：
+        - ``running_max_req_size`` 为 3
+        - ``batch_max_tokens`` 为 2048 (2k)
+        - ``chunked_prefill_size`` 为 1024 (1k)
+
+.. option:: --host
+
+    服务器监听地址，默认为 ``127.0.0.1``
+
+.. option:: --port
+
+    服务器监听端口，默认为 ``8000``
+
+.. option:: --httpserver_workers
+
+    HTTP 服务器工作进程数，默认为 ``1``
+    在 ``pd_master`` 模式下，大于 1 时启用 :doc:`pd_master_multiprocess`，
+    使用 HAProxy 统一入口和多个独立请求 worker。launcher 在启动 worker 前统一分配全部内网端口，
+    并启动共享的请求 ID 服务。P/D 将
+    ``--pd_master_ip`` 和 ``--pd_master_port`` 指向公开入口，通过 ``/get_server_info``
+    获取 worker 端口列表，以端口作为节点 ID 并直接连接。
+    多 worker master 本身不支持外部 config server 参数。
+
+.. option:: --disable_delay_response_start
+
+    立即发送流式响应的状态码和响应头，不再等待首个响应 chunk 就绪。默认情况下，LightLLM 会延迟发送
+    响应起始事件，使首个 chunk 产生前抛出的异常仍能返回正确的 HTTP 状态码。
+
+.. option:: --hypercorn_config
+
+    Hypercorn TOML 配置文件路径，仅支持 TOML 格式。示例文件见 ``test/hypercorn_config.toml``。
+    默认为 ``None``。LightLLM 显式设置的监听地址和 HTTP worker 数会覆盖配置文件中的对应值。
+
+.. option:: --zmq_mode
+
+    ZMQ 通信模式，可选值：
+    
+    * ``tcp://``: TCP 模式
+    * ``ipc:///tmp/``: IPC 模式（默认）
+    
+    只能在 ``['tcp://', 'ipc:///tmp/']`` 中选择
+
+PD 分离模式参数
+---------------
+
+.. option:: --pd_master_ip
+
+    PD 主节点 IP 地址，默认为 ``0.0.0.0``
+    
+    当 run_mode 设置为 prefill 或 decode 且未配置 config server 时，查询该地址的
+    ``/get_server_info`` 并读取 ``pd_master_multi_ports``。多 worker 模式直接以每个端口
+    作为对应 worker 的 ``pd_node_id``。
+
+.. option:: --pd_master_port
+
+    PD 主节点端口，默认为 ``1212``
+    
+    当 run_mode 设置为 prefill 或 decode 且未配置 config server 时，使用该 master 端口。
+    单 worker 使用返回的 ``pd_node_id`` 直连；多 worker 根据返回的端口列表直连每个 worker。
+
+.. option:: --pd_master_mode
+
+    PD Master 拓扑模式，可选值：
+
+    * ``elastic``：Prefill 和 Decode 节点数量可以动态变化（默认）
+    * ``<P>p<D>d``：Prefill 和 Decode 节点数量固定。例如，``2p4d``
+      表示期望恰好注册 2 个 Prefill 节点和 4 个 Decode 节点。
+
+    当 ``run_mode`` 设置为 ``pd_master`` 时使用此参数。
+    在 ``elastic`` 模式下，至少注册一个 Prefill 和一个 Decode 节点后，PD Master 才会
+    进入 ready 状态，节点数量超过一个时仍然保持 ready。使用固定拓扑模式时，只有已注册
+    节点数量与配置完全一致才进入 ready 状态。节点未 ready 时，``/health`` 和 ``/healthz``
+    以及 ``/readiness`` 返回 HTTP 503。在固定拓扑模式下，PD Master 还会并发请求所有已连接
+    Prefill 和 Decode 节点的 ``/health`` 接口；任一节点请求失败、超时或返回非 HTTP 200 时，
+    PD Master 的健康接口都会返回 HTTP 503。无论使用哪种拓扑模式，PD Master 都会同时执行与普通节点类似的
+    推理进度健康检查：当仍有在途请求，且整个 PD Master 连续 ``HEALTH_TIMEOUT`` 秒
+    没有任何请求成功返回 token 时，接口将返回 HTTP 503。
+
+.. option:: --disable_pd_node_self_request_limit
+
+    P/D 节点资源等待限流默认启用，并由 PD Master 统一管理。该参数只在需要关闭此功能时设置，且只需添加到
+    PD Master 的启动参数中，不需要在 Prefill/Decode 节点上设置。默认情况下，PD Master 通过
+    ``pd_node_resource_wait_timeout_seconds`` 为所有请求下发统一的资源等待上限；P/D 节点只负责按下发值
+    控制本地 ``shm_req`` 申请和 Router 等待进入推理系统，不读取本地限流开关或超时配置。首段的等待上限由
+    PD Master 上的
+    ``LIGHTLLM_PD_NODE_RESOURCE_WAIT_TIMEOUT_SECONDS`` 控制，默认 10 秒；设置为 -1 表示永久等待。
+    ``segment_index > 0`` 的续跑分段使用独立的等待上限，该值由
+    ``LIGHTLLM_PD_NODE_CONTINUATION_RESOURCE_WAIT_TIMEOUT_SECONDS`` 控制，默认 60 秒，以提高已产生部分结果的
+    请求最终完成的成功率。
+    设置为非负数时，超时会导致 ``Server is busy``；
+    其中已进入 Router 但仍未进入推理系统的请求会主动标记为 aborted，由 PD Master 转换为 HTTP 429。
+    本功能启用时，PD Master 收到 ``Server is busy`` 默认直接返回，不进行重试。
+    ``LIGHTLLM_PD_NODE_BUSY_RETRY_TIMEOUT_SECONDS`` 控制最长重试探测周期，默认值为 ``0``；设置为正数后，
+    PD Master 才会在该周期内重新选择 P/D 节点并重试。若请求已经向客户端输出 token，则即使配置了正数也不再
+    从头重试，以免产生重复内容。设置 ``--disable_pd_node_self_request_limit`` 后，PD Master 不再下发
+    有限的资源等待时间；P/D 节点永久等待，其他原因产生的 ``Server is busy`` 也会直接返回，不触发重试。
+    多机 TP 场景仅由 master 节点执行超时判断，slave 节点永久等待。cache 命中记录允许提升优先级的最大年龄由
+    ``LIGHTLLM_PD_CACHE_HIGH_PRIORITY_MAX_AGE_SECONDS`` 控制，默认 36 秒。cache 命中提权还要求输入
+    token 数达到 ``LIGHTLLM_PD_CACHE_HIGH_PRIORITY_MIN_PROMPT_TOKENS`` 配置的门槛（默认 4096），避免短请求仅因
+    cache 命中率高而提升优先级。
+
+    以下示例显式开启最长 120 秒的节点繁忙重试：
+
+    .. code-block:: bash
+
+        LIGHTLLM_PD_NODE_RESOURCE_WAIT_TIMEOUT_SECONDS=10 \
+            LIGHTLLM_PD_NODE_CONTINUATION_RESOURCE_WAIT_TIMEOUT_SECONDS=60 \
+            LIGHTLLM_PD_NODE_BUSY_RETRY_TIMEOUT_SECONDS=120 \
+            python -m lightllm.server.api_server --run_mode pd_master ...
+
+.. option:: --disable_pd_cache_high_priority
+
+    禁止 PD Master 将输入足够长、预计输入 cache 命中率高且命中记录仍然新鲜的首段请求提升为高优先级。
+    该参数不影响 PD Decode 容量不足后的分段续跑请求；续跑请求仍保持高优先级。默认不启用，
+    即默认允许新鲜高 cache 命中请求提升优先级。
+
+    建议只在 PD Master 上配置该参数。当单个 P 节点的 GPU cache、CPU cache 和 disk cache 总容量相对于
+    请求工作集较小时，高负载下后到的请求容易快速淘汰已有 cache，使原本可以命中 cache 的请求退化为
+    重新执行 Prefill，进而显著降低 Prefill 效率。此时建议保留默认的高优先级策略，让预计 cache 命中率高的
+    请求提前进入推理，尽量在 cache 被淘汰前完成复用。
+
+    该策略会改变排队顺序，因此普通请求（未达到 cache 命中率、cache 年龄或最小 prompt token 数门槛的请求）
+    的首字延迟可能升高。如果 P 节点 cache 容量充足、系统负载较低，或者业务更重视调度公平性和普通请求的
+    首字延迟，可以设置 ``--disable_pd_cache_high_priority`` 关闭该策略。
+
+.. option:: --config_server_host
+
+    配置服务器模式下的主机地址
+
+.. option:: --config_server_port
+
+    配置服务器模式下的端口号
+
+模型配置参数
+------------
+
+.. option:: --model_name
+
+    模型名称，用于区分内部模型名称，默认为 ``default_model_name``
+    
+    可通过 ``host:port/get_model_name`` 获取
+
+.. option:: --model_dir
+
+    模型权重目录路径，应用将从该目录加载配置、权重和分词器
+
+.. option:: --tokenizer_mode
+
+    分词器加载模式，可选值：
+    
+    * ``slow``: 慢速模式，加载快但运行慢，适合调试和测试
+    * ``fast``: 快速模式（默认），获得最佳性能
+    * ``auto``: 自动模式，尝试使用快速模式，失败则使用慢速模式
+
+.. option:: --load_way
+
+    模型权重加载方式，默认为 ``HF`` (Huggingface 格式)
+    
+    llama 模型还支持 ``DS`` (Deepspeed) 格式
+
+.. option:: --trust_remote_code
+
+    是否允许在 Hub 上使用自定义模型定义的文件
+
+内存和批处理参数
+----------------
+
+.. option:: --max_total_token_num
+
+    GPU 和模型支持的总 token 数量，等于 max_batch * (input_len + output_len)
+    
+    如果不指定，将根据 mem_fraction 自动计算
+
+.. option:: --mem_fraction
+
+    内存使用比例，默认为 ``0.9``
+    
+    如果运行时出现 OOM，可以指定更小的值
+
+.. option:: --batch_max_tokens
+
+    新批次的最大 token 数量，控制预填充批次大小以防止 OOM
+
+.. option:: --running_max_req_size
+
+    本机共享请求槽总数，默认为 ``256``。
+    DP 模式按 ``ceil(running_max_req_size / 本机 DP rank 数)``
+    分配每个 rank 的请求状态槽，调度并发和 CUDA Graph batch 上限也受此限制。
+    diverse 模式及 DP prompt cache fetch 模式保持原有容量。
+
+.. option:: --max_req_total_len
+
+    请求输入长度 + 请求输出长度的最大值。若未显式设置，将从模型配置自动推导，
+    若推导失败则回退到 ``16384``。
+    对于部分 RoPE 类型（如 ``yarn/dynamic/su/llama3``），推导不会直接用 ``rope_scaling.factor``
+    去乘以 ``max_position_embeddings``，以避免过度估算最大长度。
+
+.. option:: --eos_id
+
+    结束停止 token ID，可以指定多个值。如果为 None，将从 config.json 加载
+
+.. option:: --tool_call_parser
+
+    openai接口工具调用解析器类型，可选值：
+    
+    * ``qwen25``
+    * ``llama3``
+    * ``mistral``
+
+不同并行模式设置参数
+--------------------
+
+.. option:: --nnodes
+
+    节点数量，默认为 ``1``
+
+.. option:: --node_rank
+
+    当前节点的排名，默认为 ``0``
+
+.. option:: --multinode_httpmanager_port
+
+    多节点 HTTP 管理器端口，默认为 ``12345``
+
+.. option:: --multinode_router_gloo_port
+
+    多节点路由器 gloo 端口，默认为 ``20001``
+
+.. option:: --tp
+
+    模型张量并行大小，默认为 ``1``
+
+.. option:: --dp
+
+    数据并行大小，默认为 ``1``
+    
+    这是 deepseekv2 的有用参数。使用 deepseekv2 模型时，将 dp 设置为等于 tp 参数。
+    其他情况下请不要设置，保持默认值 1。
+
+.. option:: --nccl_host
+
+    用于构建 PyTorch 分布式环境的 nccl_host，默认为 ``127.0.0.1``
+    
+    多节点部署时，应设置为主节点的 IP
+
+.. option:: --nccl_port
+
+    用于构建 PyTorch 分布式环境的 nccl_port，默认为 ``28765``
+
+.. option:: --use_config_server_to_init_nccl
+
+    使用由 config_server 启动的 tcp store 服务器初始化 nccl，默认为 False
+    
+    设置为 True 时，--nccl_host 必须等于 config_server_host，--nccl_port 对于 config_server 必须是唯一的，
+    不要为不同的推理节点使用相同的 nccl_port，这将是严重错误
+
+
+调度参数
+--------
+
+.. option:: --router_token_ratio
+
+    判断服务是否繁忙的阈值，默认为 ``0.0``，一旦kv cache 使用率超过此值，则会直接变为保守调度。
+
+.. option:: --router_max_wait_tokens
+
+    每 router_max_wait_tokens 解码步骤后触发一次调度新请求，默认为 ``6``
+
+.. option:: --disable_aggressive_schedule
+
+    禁用激进调度
+    
+    激进调度可能导致解码期间频繁的预填充中断。禁用它可以让 router_max_wait_tokens 参数更有效地工作。
+
+.. option:: --enable_prefill_decode_mixed
+
+    在同一次推理调度步骤中混合执行 prefill 与 decode。
+
+    仅支持 ``--run_mode`` 为 ``normal`` 时开启。当同时存在 prefill 与 decode 请求时，调度器会在同一步内
+    先执行 prefill、再执行 decode，而不是在激进调度下只执行 prefill、阻塞 decode，从而在有新 prefill
+    请求时也能推进 decode，提升整体吞吐。
+
+    不能与 ``--enable_prefill_microbatch_overlap`` 或 ``--enable_decode_microbatch_overlap`` 同时使用。
+
+.. option:: --disable_dynamic_prompt_cache
+
+    禁用kv cache 缓存
+
+.. option:: --chunked_prefill_size
+
+    分块预填充大小，默认为 ``4096``
+
+.. option:: --disable_chunked_prefill
+
+    是否禁用分块预填充
+
+.. option:: --disable_chunked_mm_input
+
+    Neo、DeepSeek-V4 和 Gemma4 默认开启，其他模型默认关闭，可通过此参数开启。
+    开启后，每个图像或音频 token 块在同一次 prefill 中处理，文本仍可分块。
+    完整块可以超过 ``chunked_prefill_size``，但必须能放入 ``batch_max_tokens``；
+    启用图像时，要求 ``batch_max_tokens >= max_image_token_count``。
+    GPU、CPU 和磁盘缓存的恢复点都会避开块内部。
+
+.. option:: --prefill_queue_strategy
+
+    推理后端在资源分配前使用的 prefill 排序策略，默认值为 ``auto``（按运行模式自动选择）。
+    策略先将等待暂停、已暂停、已结束、已中止或已标记清理的请求按原始相对顺序放到队尾，再识别其余
+    decode 请求，将其稳定地放在队列最左侧且不参与后续排序；
+    ``infer_high_priority`` 和所选策略只作用于右侧的 prefill 请求。
+
+    prefill 请求带有内部字段 ``infer_high_priority``。该字段默认为 ``0``，不接受外部请求设置；
+    PD 分离模式会为续跑分段设置负值，使其在推理进程中优先于普通请求。
+
+    * ``auto``：根据 ``--run_mode`` 自动选择：单机普通模式
+      （``normal``）和 Decode 节点（``decode``）使用 ``default``，Prefill 节点
+      （``prefill``）使用 ``hrrn``。省略本参数与显式设置 ``auto`` 相同。
+      显式指定下列策略时，不会被自动选择覆盖。
+    * ``default``：按 ``infer_high_priority`` 从小到大稳定排序，相同值内保持 FCFS 顺序。
+    * ``promote_shortest``：负优先级 prefill 请求按到达顺序排在前面；在非负优先级的
+      普通请求中选择剩余 prefill token 最少的一个，将其移动到普通请求队头，其余普通
+      请求保持相对顺序。尚未结束但已完成 prompt 计算的请求按零计算。该模式主要适合 PD 分离的
+      Prefill 节点，用于改善部分短请求的 TTFT 和首字体验。
+    * ``hrrn``：负优先级 prefill 请求仍排在最前面；普通请求按基于 token aging 的最高
+      响应比优先（Highest Response Ratio Next）策略排序。等待量从请求首次参与 HRRN 排序时开始累计。
+      响应比使用请求等待期间已处理的
+      prefill token 数与该请求首次参与 HRRN 排序时未缓存的 prefill token 数计算，既倾向于较短请求，也会随等待量
+      增加逐步提升长请求优先级，避免纯最短任务优先造成饥饿。该模式适合 PD 分离的 Prefill
+      节点中请求长度差异较大的流量。该策略参考了
+      `SGLang PR #32911 <https://github.com/sgl-project/sglang/pull/32911>`_，感谢原作者及 SGLang 社区的贡献。
+
+    例如，在原启动命令中添加 ``--prefill_queue_strategy hrrn``。
+    应结合实际流量的 TTFT、TPOT 和尾延迟压测选择策略，策略本身不保证 SLA 改善。
+    完整的调度流程、算法细节和排序示例见 :doc:`Prefill 排队策略 <prefill_queue_strategy>`。
+
+    扩展策略时，在 ``lightllm/server/router/model_infer/mode_backend/prefill_queue_strategy`` 中继承
+    ``PrefillQueueStrategy`` 并实现 ``reorder_prefill``，然后加入 ``PREFILL_QUEUE_STRATEGIES``
+    映射，并同步更新 CLI 和 ``StartArgs`` 的可选值，
+    即可通过启动参数选择。实现必须保持请求集合、请求状态和输入列表不变，
+    并保证各 TP rank 的排序结果一致。策略构造函数会接收当前 ``ModeBackend`` 实例，
+    可通过 ``self.backend`` 读取调度所需的全局状态。
+
+.. option:: --diverse_mode
+
+    多结果输出模式
+
+.. option:: --schedule_time_interval
+
+    调度时间间隔，默认为 ``0.03``，单位为秒
+
+
+输出约束参数
+------------
+
+.. option:: --output_constraint_mode
+
+    设置输出约束后端，可选值：
+    
+    * ``xgrammar``: 默认值，按请求启用，支持 JSON Schema、JSON object、EBNF 和 regex
+    * ``none``: 关闭输出约束后端
+
+    支持 TP/DP、MTP 和 microbatch overlap。Outlines 后端已移除，
+    ``regular_constraint`` 使用 XGrammar 的 regex 语法。
+
+    ChatCompletion 的 JSON Schema / JSON object 约束在 thinking 结束后生效，
+    以配置的 reasoning parser 结束标记为准；关闭 thinking 时从首个输出 token 生效。
+
+.. option:: --grammar_compile_timeout
+
+    HTTP 侧 grammar 编译等待超时，默认 ``30.0`` 秒，必须大于 0。
+    非法语法、编译失败或超时会在推理和流式响应开始前返回 HTTP 400。
+
+多模态参数
+----------
+
+.. option:: --disable_vision
+
+    如果模型是多模态模型，设置此参数将不加载视觉部分模型（默认为None，会根据模型自动检测）
+
+.. option:: --disable_audio
+
+    如果模型是多模态模型，设置此参数将不加载音频部分模型（默认为None，会根据模型自动检测）
+
+.. option:: --enable_multimodal_url_cache
+
+    在本地进程中缓存图片、视频和音频的 URL 内容，避免重复下载，默认关闭。默认最多缓存 ``512`` 个资源，可通过 ``LIGHTLLM_URL_POOL_MAXSIZE`` 配置。
+
+.. option:: --enable_mps
+
+    是否为多模态服务启用 nvidia mps
+
+.. option:: --cache_capacity
+
+    多模态资源的缓存服务器容量，默认为 ``200``
+
+.. option:: --max_image_token_count
+
+    单张图片在转换为 token 后允许的最大 token 数量，默认为 ``6128``
+
+    当任意图片超过该阈值时，请求会被拒绝。
+
+.. option:: --max_image_pixels
+
+    单张图片在预处理缩放前允许的最大像素数量，默认为 ``8294400``（约等于 4K 图片像素总量）。
+
+    当输入图片超过该阈值时，LightLLM 会先自动将其缩放到该像素预算内，再继续后续流程。
+
+    多模态 PD 分离模式下，PD Master 与所有 Prefill 节点必须使用相同值，否则 Prefill 注册会被拒绝。
+
+.. option:: --disable_image_resize
+
+    禁用对超过 ``--max_image_pixels`` 的图片的自动缩放。默认开启自动缩放。
+
+    多模态 PD 分离模式下，PD Master 与所有 Prefill 节点必须使用相同值。
+
+.. option:: --visual_infer_batch_size
+
+    每次推理批次中处理的图像数量，默认为 ``1``
+
+.. option:: --visual_gpu_ids
+
+    要使用的 GPU ID 列表，例如 0 1 2
+
+.. option:: --visual_tp
+
+    ViT 的张量并行实例数量，默认为 ``1``
+
+.. option:: --visual_dp
+
+    ViT 的数据并行实例数量，默认为 ``1``
+
+.. option:: --vit_att_backend
+
+    设置 ViT 使用的注意力后端。可选值为：
+
+    * ``auto``: 自动选择最佳后端（默认值），优先级为 fa3 > xformers > sdpa > triton
+    * ``fa3``: 使用 Flash-Attention 3 后端
+    * ``xformers``: 使用 xformers 后端
+    * ``sdpa``: 使用 sdpa 后端
+    * ``triton``: 使用 Triton 后端
+
+
+性能优化参数
+------------
+
+.. option:: --disable_symm_mem_allreduce
+
+    禁用默认开启的 SymmMem all-reduce 快路径，并回退到 NCCL
+
+.. option:: --disable_flashinfer_allreduce
+
+    禁用默认开启的 FlashInfer all-reduce 快路径，并回退到 SymmMem / NCCL
+
+.. option:: --enable_tpsp_mix_mode
+
+    推理后端将使用 TP SP 混合运行模式
+    
+    目前仅支持 llama 和 deepseek系列 模型
+
+.. option:: --enable_prefill_microbatch_overlap
+
+    推理后端将为预填充使用微批次重叠模式
+    
+    目前仅支持 deepseek系列 模型
+
+.. option:: --enable_decode_microbatch_overlap
+
+    推理后端将为解码使用微批次重叠模式
+
+.. option:: --llm_prefill_att_backend
+
+    设置预填充（Prefill）阶段使用的注意力后端。对于 Qwen3.5 等混合线性注意力模型，
+    第一个值用于选择全注意力后端，可选的第二个值用于选择线性注意力后端。
+    如果省略第二个值，则默认按 ``auto`` 处理。
+
+    全注意力后端可选值：
+
+    * ``auto``: 自动选择最佳后端（默认值），优先级为 fa3 > flashinfer > triton
+    * ``fa3``: 使用 Flash-Attention 3 后端
+    * ``flashinfer``: 使用 FlashInfer 后端
+    * ``triton``: 使用 Triton 后端
+
+    Qwen3.5 线性注意力后端可选值：
+
+    * ``auto``: 自动选择最佳后端（默认值），优先级为 flashqla > triton
+    * ``flashqla``: 使用 FlashQLA 后端
+    * ``triton``: 使用 Triton 后端
+
+    示例：``--llm_prefill_att_backend fa3 flashqla``。
+
+.. option:: --llm_decode_att_backend
+
+    设置解码（Decode）阶段使用的注意力后端。对于 Qwen3.5 等混合线性注意力模型，
+    第一个值用于选择全注意力后端，可选的第二个值用于选择线性注意力后端。
+    如果省略第二个值，则默认按 ``auto`` 处理。
+
+    全注意力后端可选值：
+
+    * ``auto``: 自动选择最佳后端（默认值），优先级为 fa3 > flashinfer > triton
+    * ``fa3``: 使用 Flash-Attention 3 后端
+    * ``flashinfer``: 使用 FlashInfer 后端
+    * ``triton``: 使用 Triton 后端
+
+    Qwen3.5 线性注意力后端可选值：
+
+    * ``auto``: 自动选择最佳后端（默认值，当前选择 triton）
+    * ``triton``: 使用 Triton 后端
+
+    示例：``--llm_decode_att_backend flashinfer triton``。
+    
+.. option:: --llm_kv_type
+
+    推理后端使用什么类型的数据存储kv cache, 可选值为 "None", "int8kv", "int4kv", "fp8kv_sph", "fp8kv_spt"
+
+    - ``fp8kv_sph``: FP8 静态按 head 量化，对应 fa3 后端
+    - ``fp8kv_spt``: FP8 静态按 tensor 量化，对应 flashinfer 后端
+
+.. option:: --linear_att_hash_page_size
+
+    线性注意力的哈希页大小，默认为 ``512``。
+
+    该参数控制每个哈希桶中的 token 数量，会影响 radix cache 的复用效果。
+
+.. option:: --linear_att_page_block_num
+
+    线性注意力状态存储使用的块数量，默认为 ``10000000``。
+
+    该参数控制用于保存注意力状态的可用页数，会影响内存占用和多轮对话性能。
+    在当前实现中，可将块大小近似理解为
+    ``linear_att_page_block_num * linear_att_hash_page_size``。
+    当 ``linear_att_page_block_num * linear_att_hash_page_size > max_req_total_len`` 时，
+    radix cache 的块级匹配能力会近似被关闭，此时更依赖请求级别的小块匹配（小块大小为 ``linear_att_hash_page_size``）。
+    如果负载较高，小块数量不足叠加内部 LRU 淘汰机制，可能导致 cache 命中率下降。
+
+    当开启 ``--enable_cpu_cache`` 时，cpu cache 的 page 大小会被强制设置为
+    ``linear_att_page_block_num * linear_att_hash_page_size``，以满足内部复用约束。
+
+.. option:: --linear_att_cache_size
+
+    线性注意力缓存大小。
+
+    不指定时会根据缓存相关配置自动计算。
+    当高负载下出现小块缓存命中不足（例如受小块数量和 LRU 淘汰影响）时，
+    可以调大该参数以提升命中率，但会增加内存占用。
+
+.. option:: --linear_att_ssm_data_type
+
+    线性注意力 SSM 状态的数据类型，可选值：
+
+    * ``bfloat16``
+    * ``float32``（默认）
+
+.. option:: --disable_cudagraph
+
+    禁用解码阶段的 cudagraph
+
+.. option:: --graph_max_batch_size
+
+    解码阶段可以被 cuda graph 捕获的最大批次大小，默认为 ``256``
+
+.. option:: --graph_split_batch_size
+
+    控制解码期间生成 CUDA graph 的间隔，默认为 ``32``
+    
+    对于从 1 到指定 graph_split_batch_size 的值，将连续生成 CUDA graph。
+    对于从 graph_split_batch_size 到 graph_max_batch_size 的值，
+    每增加 graph_grow_step_size 就会生成一个新的 CUDA graph。
+    正确配置此参数可以帮助优化 CUDA graph 执行的性能。
+
+.. option:: --graph_grow_step_size
+
+    对于从 graph_split_batch_size 到 graph_max_batch_size 的 batch_size 值，
+    每增加 graph_grow_step_size 就会生成一个新的 CUDA graph，默认为 ``16``
+
+.. option:: --graph_max_len_in_batch
+
+    解码阶段可以被 cuda graph 捕获的最大序列长度，默认为 ``0``
+    
+    默认值为 8192。如果遇到更大的值，将转为 eager 模式。
+
+量化参数
+--------
+
+.. option:: --quant_type
+
+    ``W`` 表示权重，``A`` 表示激活。可选值如下：
+
+    .. list-table::
+       :header-rows: 1
+       :widths: 35 45 20
+       :align: left
+
+       * - ``quant_type``
+         - 量化介绍
+         - 实现 backend
+       * - ``w8a8``
+         - INT8 W8A8；W：per-channel，A：per-token
+         - vLLM
+       * - ``fp8w8a8``
+         - FP8 W8A8；W：per-channel，A：per-token
+         - vLLM
+       * - ``fp8w8a8-pt``
+         - FP8 W8A8；W：per-tensor，A：per-token
+         - Triton
+       * - ``fp8w8a8-b128``
+         - FP8 W8A8；W：per-block 128×128，A：per-token-group 128
+         - Triton
+       * - ``fp8w8a8g128``
+         - FP8 W8A8；W：per-channel，A：per-token-group 128
+         - Triton
+       * - ``fp8w8a8g64``
+         - FP8 W8A8；W：per-channel，A：per-token-group 64
+         - Triton
+       * - ``awq``
+         - INT4 weight-only；group size 由 checkpoint 提供
+         - vLLM
+       * - ``awq_marlin``
+         - INT4 weight-only；group size 由 checkpoint 提供
+         - vLLM
+       * - ``none``
+         - 不量化
+         - -
+       * - ``w8a8-vllm``
+         - INT8 W8A8；W：per-channel，A：per-token
+         - vLLM
+       * - ``fp8w8a8-vllm``
+         - FP8 W8A8；W：per-channel，A：per-token
+         - vLLM
+       * - ``fp8w8a8-pt-vllm``
+         - FP8 W8A8；W：per-tensor，A：per-token
+         - vLLM
+       * - ``fp8w8a8-pt-sgl``
+         - FP8 W8A8；W：per-tensor，A：per-token
+         - SGL
+       * - ``fp8w8a8-pt-triton``
+         - FP8 W8A8；W：per-tensor，A：per-token
+         - Triton
+       * - ``fp8w8a8-b128-vllm``
+         - FP8 W8A8；W：per-block 128×128，A：per-token-group 128
+         - vLLM
+       * - ``fp8w8a8-b128-deepgemm``
+         - FP8 W8A8；W：per-block 128×128，A：per-token-group 128
+         - DeepGEMM
+       * - ``fp8w8a8-b128-triton``
+         - FP8 W8A8；W：per-block 128×128，A：per-token-group 128
+         - Triton
+       * - ``fp8w8a8g128-triton``
+         - FP8 W8A8；W：per-channel，A：per-token-group 128
+         - Triton
+       * - ``fp8w8a8g64-triton``
+         - FP8 W8A8；W：per-channel，A：per-token-group 64
+         - Triton
+       * - ``fp4fp8-b32-deepgemm``
+         - FP4/FP8 混合量化；仅用于 fused MoE 专家权重（SM100）
+         - DeepGEMM
+
+.. option:: --quant_cfg
+
+    量化配置文件路径。可用于混合量化。
+    
+    示例可以在 test/advanced_config/mixed_quantization/llamacls-mix-down.yaml 中找到。
+
+.. option:: --expert_dtype
+
+    EP MoE 专家量化类型，可选值：
+
+    * ``fp8``
+    * ``fp4``，仅支持 SM100 GPU
+    * ``None`` (默认)
+
+.. option:: --vit_quant_type
+
+    ViT 量化方法，可选值：
+
+    * ``w8a8``
+    * ``fp8w8a8``
+    * ``none`` (默认)
+
+.. option:: --vit_quant_cfg
+
+    ViT 量化配置文件路径。可用于混合量化。
+    
+    示例可以在 lightllm/common/quantization/configs 中找到。
+
+采样和生成参数
+--------------
+
+.. option:: --sampling_backend
+
+    采样使用的实现，可选值：
+    
+    * ``triton``: 使用 torch 和 triton kernel（默认）
+    * ``sglang_kernel``: 使用 sglang_kernel 实现
+
+.. option:: --enable_prompt_logprobs
+
+    启用 prompt top-k logprobs 捕获
+
+.. option:: --use_reward_model
+
+    使用奖励模型
+
+.. option:: --use_tgi_api
+
+    使用 tgi 输入和输出格式
+
+MTP 多预测参数
+--------------
+
+.. option:: --mtp_mode
+
+    支持的 mtp 模式，建议使用 eagle_with_att获得更好的性能体验，可选值：
+    
+    * ``vanilla_with_att``
+    * ``eagle_with_att``
+    * ``vanilla_no_att``
+    * ``eagle_no_att``
+    * ``None``: 不启用 mtp（默认）
+
+.. option:: --mtp_draft_model_dir
+
+    MTP 多预测功能的草稿模型路径
+    
+    用于加载 MTP 多输出 token 模型。
+
+.. option:: --mtp_step
+
+    指定使用草稿模型预测的额外 token 数量，默认为 ``0``
+    
+    目前此功能仅支持 DeepSeekV3/R1 模型。
+    增加此值允许更多预测，但确保模型与指定的步数兼容。
+    目前 deepseekv3/r1 模型仅支持 1 步
+
+DeepSeek 冗余专家参数
+---------------------
+
+.. option:: --ep_redundancy_expert_config_path
+
+    冗余专家配置的路径。可用于 deepseekv3 模型。
+
+.. option:: --auto_update_redundancy_expert
+
+    是否通过在线专家使用计数器为 deepseekv3 模型更新冗余专家。
+
+监控和日志参数
+--------------
+
+.. option:: --health_monitor
+
+    检查服务健康状态并在出错时重启
+
+.. option:: --metric_gateway
+
+    收集监控指标的地址
+
+.. option:: --job_name
+
+    监控的作业名称，默认为 ``lightllm``
+
+.. option:: --grouping_key
+
+    监控的分组键，格式为 key=value，可以指定多个
+
+.. option:: --push_interval
+
+    推送监控指标的间隔（秒），默认为 ``10``
+
+.. option:: --enable_monitor_auth
+
+    是否为 push_gateway 开启身份验证

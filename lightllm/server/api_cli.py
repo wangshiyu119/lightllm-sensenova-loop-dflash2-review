@@ -1,0 +1,1078 @@
+import argparse
+import json
+
+
+def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    parser.formatter_class = argparse.RawTextHelpFormatter
+
+    parser.add_argument(
+        "--run_mode",
+        type=str,
+        choices=[
+            "normal",
+            "prefill",
+            "decode",
+            "pd_master",
+            "config_server",
+            "visual_only",
+        ],
+        default="normal",
+        help="""set run mode, normal is started for a single server, prefill/decode/pd_master is for pd split run mode,
+                config_server is for pd split mode used to register pd_master node, and get pd_master node list,
+                specifically designed for large-scale, high-concurrency scenarios where `pd_master` encounters
+                significant CPU bottlenecks.""",
+    )
+    parser.add_argument(
+        "--performance_mode",
+        "--p_mode",
+        type=str,
+        choices=["personal"],
+        default=None,
+        help="""performance mode for different scenarios.
+                None: no performance mode applied (default).
+                personal: private personal running mode, automatically sets running_max_req_size to 3.""",
+    )
+    parser.add_argument("--host", type=str, default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--httpserver_workers",
+        type=int,
+        default=None,
+        help=(
+            "Number of httpserver worker processes. When omitted, normal mode uses 1 and "
+            "prefill/decode nodes use 2. Multinode TP slaves always use 1."
+        ),
+    )
+    parser.add_argument(
+        "--disable_delay_response_start",
+        action="store_true",
+        help=(
+            "Send streaming response status and headers immediately instead of waiting until the first "
+            "response chunk is ready."
+        ),
+    )
+    parser.add_argument(
+        "--hypercorn_config",
+        type=str,
+        default=None,
+        help="Path to a Hypercorn TOML configuration file. See test/hypercorn_config.toml for an example.",
+    )
+    parser.add_argument(
+        "--zmq_mode",
+        type=str,
+        default="ipc:///tmp/",
+        help="use socket mode or ipc mode, only can be set in ['tcp://', 'ipc:///tmp/']",
+    )
+
+    parser.add_argument(
+        "--pd_master_ip",
+        type=str,
+        default="0.0.0.0",
+        help="when run_mode set to prefill or decode, you need set this pd_mater_ip",
+    )
+    parser.add_argument(
+        "--pd_master_port",
+        type=int,
+        default=1212,
+        help="when run_mode set to prefill or decode, you need set this pd_mater_port",
+    )
+    parser.add_argument(
+        "--pd_master_mode",
+        type=str,
+        default="elastic",
+        help=(
+            "PD master topology mode: elastic allows the number of Prefill and Decode nodes to change "
+            "dynamically; use <P>p<D>d for a fixed topology, for example 2p4d. Default: elastic."
+        ),
+    )
+    parser.add_argument(
+        "--disable_pd_node_self_request_limit",
+        action="store_true",
+        help=(
+            "Disable PD Master-managed resource wait limiting and retries for requests rejected as server busy. "
+            "Configure this option only on PD Master. By default, PD Master sends timeout details to P/D nodes, "
+            "which only enforce the received values. Busy requests are returned without retrying by default; "
+            "set LIGHTLLM_PD_NODE_BUSY_RETRY_TIMEOUT_SECONDS to a positive value to enable retries while this "
+            "feature is enabled. Requests that have already streamed response tokens are not restarted."
+        ),
+    )
+    parser.add_argument(
+        "--disable_pd_cache_high_priority",
+        action="store_true",
+        help=(
+            "Disable PD Master's high-priority scheduling for first-segment requests with a fresh, high "
+            "cache-hit estimate. Keep this policy enabled when a Prefill node's combined GPU, CPU, and disk "
+            "cache is small relative to its workload: under high load, ordinary scheduling can evict reusable "
+            "cache entries before they are consumed and significantly reduce Prefill efficiency. The policy "
+            "lets eligible cache-hit requests run earlier, but may increase TTFT for ordinary requests. "
+            "Consider disabling it only when scheduling fairness or ordinary-request latency is more important, "
+            "or when cache capacity is sufficient and cache churn is low. Segmented continuation requests remain "
+            "high priority. Configure this option only on PD Master. The policy is enabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--pd_trans_mode",
+        type=str,
+        choices=["nccl", "nixl"],
+        default="nccl",
+        help="KV transfer backend for PD disaggregation; default: nccl",
+    )
+    parser.add_argument(
+        "--use_dp_split_mode_connect_pd_master",
+        action="store_true",
+        help="Prefill only: register a separate PD master connection for each local DP rank",
+    )
+    parser.add_argument(
+        "--select_p_d_node_strategy",
+        type=str,
+        default="cache_aware",
+        choices=["random", "round_robin", "adaptive_load", "cache_aware"],
+        help="pd master use this strategy to select p d node; default cache_aware",
+    )
+    parser.add_argument(
+        "--config_server_host",
+        type=str,
+        default=None,
+        help="The host address for the config server in config_server mode.",
+    )
+    parser.add_argument(
+        "--config_server_port",
+        type=int,
+        default=None,
+        help="The port number for the config server in config_server mode.",
+    )
+    parser.add_argument(
+        "--config_server_visual_redis_port",
+        type=int,
+        default=None,
+        help="""when run_mode is config_server, set this params will start a redis server,
+        when a llm infer node start to set this params, the visual infer module will start a
+        proxy module use config server to find  remote vit infer nodes to infer img""",
+    )
+    parser.add_argument(
+        "--pd_kv_page_num",
+        type=int,
+        default=16,
+        help="pd mode, kv move page_num",
+    )
+
+    parser.add_argument(
+        "--pd_kv_page_size",
+        type=int,
+        default=1024,
+        help="pd mode, kv page size.",
+    )
+
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default="default_model_name",
+        help="just help to distinguish internal model name, use 'host:port/get_model_name' to get",
+    )
+    parser.add_argument(
+        "--model_owner",
+        type=str,
+        default=None,
+        help="the model owner, if not set, will use lightllm",
+    )
+
+    parser.add_argument(
+        "--model_dir",
+        type=str,
+        default=None,
+        help="the model weight dir path, the app will load config, weights and tokenizer from this dir",
+    )
+    parser.add_argument(
+        "--tokenizer_mode",
+        type=str,
+        default="fast",
+        help="""tokenizer load mode, can be slow, fast or auto, slow mode load fast but run slow,
+          slow mode is good for debug and test, fast mode get best performance, auto mode will
+          try to use fast mode, if failed will use slow mode""",
+    )
+    parser.add_argument(
+        "--load_way",
+        type=str,
+        default="HF",
+        help="""the way of loading model weights, the default is HF(Huggingface format), llama also supports
+          DS(Deepspeed)""",
+    )
+    parser.add_argument(
+        "--max_total_token_num",
+        type=int,
+        default=None,
+        help="the total token nums the gpu and model can support, equals = max_batch * (input_len + output_len)",
+    )
+    parser.add_argument(
+        "--mem_fraction",
+        type=float,
+        default=0.8,
+        help="""Memory usage ratio, default is 0.8, you can specify a smaller value if OOM occurs at runtime.
+        If max_total_token_num is not specified, it will be calculated automatically based on this value.""",
+    )
+    parser.add_argument(
+        "--batch_max_tokens",
+        type=int,
+        default=None,
+        help="max tokens num for new cat batch, it control prefill batch size to Preventing OOM",
+    )
+    parser.add_argument(
+        "--eos_id", nargs="+", type=int, default=None, help="eos stop token id, if None, will load from config.json"
+    )
+    parser.add_argument(
+        "--tool_call_parser",
+        type=str,
+        choices=[
+            "qwen25",
+            "llama3",
+            "mistral",
+            "deepseekv3",
+            "qwen",
+            "deepseekv31",
+            "deepseekv32",
+            "deepseekv4",
+            "glm47",
+            "kimi_k2",
+            "qwen3_coder",
+        ],
+        default=None,
+        help="tool call parser type",
+    )
+    parser.add_argument(
+        "--reasoning_parser",
+        type=str,
+        choices=[
+            "deepseek-r1",
+            "deepseek-v3",
+            "deepseek-v4",
+            "glm45",
+            "gpt-oss",
+            "kimi",
+            "kimi_k2",
+            "qwen3",
+            "qwen3-thinking",
+            "minimax",
+            "minimax-append-think",
+            "step3",
+            "nano_v3",
+            "interns1",
+            "gemma4",
+        ],
+        default=None,
+        help="reasoning parser type",
+    )
+    parser.add_argument(
+        "--chat_template",
+        type=str,
+        default=None,
+        help=(
+            "chat template jinja file path. For example:\n"
+            "- /test/chat_template/tool_chat_template_deepseekv31.jinja\n"
+            "- /test/chat_template/tool_chat_template_deepseekv32.jinja\n"
+            "- /test/chat_template/tool_chat_template_qwen.jinja\n"
+            "- /test/chat_template/tool_chat_template_deepseekr1.jinja"
+        ),
+    )
+
+    parser.add_argument(
+        "--running_max_req_size", type=int, default=256, help="the max size for forward requests in the same time"
+    )
+    parser.add_argument("--nnodes", type=int, default=1, help="the number of nodes")
+    parser.add_argument("--node_rank", type=int, default=0, help="the rank of the current node")
+    parser.add_argument(
+        "--multinode_httpmanager_port",
+        type=int,
+        default=12345,
+        help="the port for multinode http manager, default is 20000",
+    )
+    parser.add_argument(
+        "--multinode_router_gloo_port",
+        type=int,
+        default=20001,
+        help="the gloo port for multinode router, default is 20001",
+    )
+    parser.add_argument("--tp", type=int, default=1, help="model tp parral size, the default is 1")
+    parser.add_argument(
+        "--dp",
+        type=int,
+        default=1,
+        help="""This is just a useful parameter for deepseekv2. When
+                        using the deepseekv2 model, set dp to be equal to the tp parameter. In other cases, please
+                        do not set it and keep the default value as 1.""",
+    )
+    parser.add_argument(
+        "--dp_balancer",
+        type=str,
+        default="bs_balancer",
+        choices=["round_robin", "bs_balancer"],
+        help="the dp balancer type, default is bs_balancer",
+    )
+    parser.add_argument(
+        "--max_req_total_len",
+        type=int,
+        default=None,
+        help="Maximum allowed length for a request (input tokens + output tokens). "
+        "If None, it will be automatically derived from the model config.json, "
+        "and fall back to 16384 if derivation fails. "
+        "In PD (Prefill-Decode) mode, this value must be synchronized across the "
+        "PD master, prefill, and decode nodes.",
+    )
+    parser.add_argument(
+        "--nccl_host",
+        type=str,
+        default="127.0.0.1",
+        help="""The nccl_host to build a distributed environment for PyTorch.
+        When deploying in multi-node manner, the value should be set to the IP of the master node""",
+    )
+    parser.add_argument(
+        "--nccl_port", type=int, default=None, help="the nccl_port to build a distributed environment for PyTorch"
+    )
+    parser.add_argument(
+        "--use_config_server_to_init_nccl",
+        action="store_true",
+        help="""use tcp store server started by config_server to init nccl, default is False, when set to True,
+        the --nccl_host must equal to the config_server_host, and the --nccl_port must be unique for a config_server,
+        dont use same nccl_port for different inference node, it will be critical error""",
+    )
+    parser.add_argument(
+        "--trust_remote_code",
+        action="store_true",
+        help="Whether or not to allow for custom models defined on the Hub in their own modeling files.",
+    )
+    parser.add_argument("--detail_log", action="store_true", help="enable to print input infos in requests.")
+    parser.add_argument(
+        "--pd_detail_log",
+        action="store_true",
+        help=(
+            "enable verbose per-block PD KV transfer debug logs. "
+            "Request-level debug logs and warning/error logs do not require this flag."
+        ),
+    )
+    parser.add_argument(
+        "--disable_shm_warning",
+        action="store_true",
+        default=False,
+        help="""Disable periodic shared memory (/dev/shm) warning logs.
+        Our system requires sufficient available shared memory in /dev/shm,
+        so a monitoring thread is enabled to check if the capacity is adequate.
+        This setting allows you to turn off these warning checks.""",
+    )
+
+    parser.add_argument(
+        "--router_token_ratio",
+        type=float,
+        default=None,
+        help="""Token used ratio to control router dispatch, range in [0.0, 1.0].
+            When the token VRAM usage ratio is higher than this value,
+            the dispatch strategy tends to be conservative.
+            When the token VRAM usage ratio is lower than this value,
+            the dispatching of requests tends to be aggressive.
+            The default value is None, meaning it will be automatically
+            determined by the internal system based on other startup parameters.""",
+    )
+    parser.add_argument(
+        "--router_max_wait_tokens",
+        type=int,
+        default=1,
+        help="schedule new requests after every router_max_wait_tokens decode steps.",
+    )
+    parser.add_argument(
+        "--disable_aggressive_schedule",
+        action="store_true",
+        help="""aggressive schedule can lead to frequent prefill interruptions during decode.
+                disabling it allows the router_max_wait_tokens parameter to work more effectively.""",
+    )
+    parser.add_argument(
+        "--enable_prefill_decode_mixed",
+        action="store_true",
+        help="""when run_mode is normal, allow prefill and decode requests to run in the same
+        scheduling step when both exist, improving throughput under aggressive schedule.""",
+    )
+
+    parser.add_argument(
+        "--use_dynamic_prompt_cache", action="store_true", help="This argument is deprecated and no longer in use."
+    )
+    parser.add_argument("--disable_dynamic_prompt_cache", action="store_true", help="disable dynamic prompt cache")
+
+    parser.add_argument("--chunked_prefill_size", type=int, default=None, help="chunked prefill size")
+    parser.add_argument("--disable_chunked_prefill", action="store_true", help="whether to disable chunked prefill")
+    parser.add_argument(
+        "--disable_chunked_mm_input",
+        action="store_true",
+        help="Keep image/audio blocks in one prefill step. Enabled by default for Neo, DeepSeek-V4 and Gemma4.",
+    )
+    parser.add_argument(
+        "--prefill_queue_strategy",
+        choices=("auto", "default", "promote_shortest", "hrrn"),
+        default="auto",
+        help="""Order ready requests before resource allocation.
+        Decode requests are identified first, remain in arrival order, and are not reordered by these policies.
+        auto (default): automatically select hrrn for Prefill nodes (run_mode=prefill),
+        and default for normal and Decode nodes. Explicit policies override this automatic selection.
+        default: preserve FCFS order for prefill requests with the same infer_high_priority value.
+        promote_shortest: keep negative-priority requests first in arrival order, then move one
+        shortest non-negative-priority prefill request to the front of the normal requests.
+        hrrn: order normal prefill requests by token-based highest response ratio next to favor
+        short requests while aging long-waiting requests; negative-priority requests remain first.""",
+    )
+    parser.add_argument("--diverse_mode", action="store_true", help="diversity generation mode")
+    vocab_topk_choices = [2, 8, 16, 32, 64, 128, 256, 512]
+    parser.add_argument(
+        "--target_vocab_topk_sampling",
+        type=int,
+        choices=vocab_topk_choices,
+        default=None,
+        help="Top-k communication width per TP rank for target-model logits; disabled by default. "
+        "Requires --output_constraint_mode none.",
+    )
+    parser.add_argument(
+        "--draft_vocab_topk_sampling",
+        type=int,
+        choices=vocab_topk_choices,
+        default=None,
+        help="Top-k candidate count per TP rank for draft-model output; disabled by default.",
+    )
+
+    parser.add_argument(
+        "--output_constraint_mode",
+        type=str,
+        choices=["xgrammar", "none"],
+        default="xgrammar",
+        help="Output constraint backend used on demand in the regular inference pipeline; none rejects constraints.",
+    )
+    parser.add_argument(
+        "--grammar_compile_timeout",
+        type=float,
+        default=30.0,
+        help="HTTP grammar compilation timeout in seconds; failures and timeouts return HTTP 400 before inference.",
+    )
+    parser.add_argument(
+        "--disable_vision",
+        action="store_true",
+        default=None,
+        help="if the model is a multimodal model, set to not load vision part model.",
+    )
+    parser.add_argument(
+        "--disable_audio",
+        action="store_true",
+        default=None,
+        help="if the model is a multimodal model, set to not load audio part model.",
+    )
+    parser.add_argument(
+        "--enable_multimodal_url_cache",
+        action="store_true",
+        help="cache image, video, and audio URL content in the local process to avoid repeated downloads.",
+    )
+    parser.add_argument(
+        "--enable_mps", action="store_true", help="Whether to enable nvidia mps for multimodal service."
+    )
+    parser.add_argument(
+        "--disable_symm_mem_allreduce",
+        action="store_true",
+        help="Disable the default SymmMem all-reduce fast path and fall back to NCCL.",
+    )
+    parser.add_argument(
+        "--disable_flashinfer_allreduce",
+        action="store_true",
+        help="Disable the default FlashInfer all-reduce fast path and fall back to SymmMem / NCCL.",
+    )
+    parser.add_argument(
+        "--enable_tpsp_mix_mode",
+        action="store_true",
+        help="""inference backend will use TP SP Mixed running mode.
+        only llama and deepseek v3 model supported now.""",
+    )
+    parser.add_argument(
+        "--enable_dp_prefill_balance",
+        action="store_true",
+        help="inference backend will use dp balance, need set --enable_tpsp_mix_mode first",
+    )
+    parser.add_argument(
+        "--enable_prefill_microbatch_overlap",
+        action="store_true",
+        help="""inference backend will use microbatch overlap mode for prefill.
+        only deepseekv3 model supported now.""",
+    )
+    parser.add_argument(
+        "--enable_decode_microbatch_overlap",
+        action="store_true",
+        help="""inference backend will use microbatch overlap mode for decode.
+        only deepseekv3 model supported now.""",
+    )
+    parser.add_argument(
+        "--llm_prefill_att_backend",
+        type=str,
+        nargs="+",
+        choices=["auto", "triton", "fa3", "flashinfer", "flashqla", "flashkda"],
+        default=["auto"],
+        help="""prefill attention kernel used in llm.
+                auto: automatically select best backend based on GPU and available packages
+                (priority: fa3 > flashinfer > triton)
+                for hybrid linear-attention models, the second value selects the linear-attention backend
+                (GDN priority: flashqla > triton; KDA auto: shape-dependent FlashKDA on Hopper with
+                BF16 state, otherwise Triton; explicit flashkda requires a compatible installation);
+                when omitted, it defaults to auto""",
+    )
+    parser.add_argument(
+        "--llm_decode_att_backend",
+        type=str,
+        nargs="+",
+        choices=["auto", "triton", "fa3", "flashinfer"],
+        default=["auto"],
+        help="""decode attention kernel used in llm.
+                auto: automatically select best backend based on GPU and available packages
+                (priority when mtp_step > 0: fa3 > flashinfer > triton;
+                otherwise: flashinfer > fa3 > triton)
+                for hybrid linear-attention models, the second value selects the linear-attention backend
+                (currently triton only); when omitted, it defaults to auto""",
+    )
+    parser.add_argument(
+        "--flashinfer_workspace_size",
+        type=int,
+        default=512,
+        help="FlashInfer attention workspace in MiB, shared by prefill and decode (default: 512).",
+    )
+    parser.add_argument(
+        "--page_size",
+        type=int,
+        default=1,
+        help="""KV cache page size in tokens. Values greater than 1 make each request reserve
+        page-aligned contiguous KV slots and make paged attention/cache reuse operate on full pages.""",
+    )
+    parser.add_argument(
+        "--req_token_index_mode",
+        type=str,
+        choices=["pin_mem_cache", "pin_mem_page_cache", "pure_gpu"],
+        default="pin_mem_cache",
+        help="""How each request stores its token indexes. pin_mem_cache keeps a CPU copy and uploads
+        pending indexes from a fresh pinned slice. pin_mem_page_cache stores one pinned CPU index per KV
+        page and expands it for reads and uploads. pure_gpu writes the GPU request table directly; CPU
+        reads copy back from that table.""",
+    )
+    parser.add_argument(
+        "--vit_att_backend",
+        type=str,
+        nargs="+",
+        choices=["auto", "triton", "fa3", "sdpa", "xformers"],
+        default=["auto"],
+        help="""vit attention kernel used in vlm.
+                auto: automatically select best backend based on GPU and available packages
+                (priority: fa3 > xformers > sdpa > triton)""",
+    )
+    parser.add_argument(
+        "--llm_kv_type",
+        type=str,
+        choices=["None", "int8kv", "int4kv", "fp8kv_sph", "fp8kv_spt", "fp8kv_dsa"],
+        default="None",
+        help="""kv type used in llm, None for dtype that llm used in config.json.
+                fp8kv_sph: use float8_e4m3fn to store kv cache for inference,
+                quant way is static per head kv quant.
+                fp8kv_spt: use float8_e4m3fn to store kv cache for inference,
+                quant way is static per tensor kv quant.
+                fp8kv_dsa: use dynamic per-token/group FlashMLA FP8 sparse KV cache
+                for DeepSeek-V3.2 or GLM-5.3 Flash.
+                fp8kv_sph and fp8kv_spt requires --kv_quant_calibration_config_path
+                to load pre-computed FP8 scales.
+                Note: fp8kv_spt requires flashinfer-python>=0.6.5 (default is 0.6.3,
+                may cause runtime issues). Install with: pip install flashinfer-python==0.6.5""",
+    )
+    parser.add_argument(
+        "--llm_kv_quant_group_size",
+        type=int,
+        default=8,
+        help="""kv quant group size used in llm kv, when llm_kv_type is quanted type,such as int8kv,
+        this params will be effective.
+        """,
+    )
+    parser.add_argument(
+        "--cache_capacity", type=int, default=200, help="cache server capacity for multimodal resources"
+    )
+    parser.add_argument(
+        "--max_image_token_count",
+        type=int,
+        default=8192,
+        help="maximum allowed token count for one image after tokenization",
+    )
+    parser.add_argument(
+        "--max_image_pixels",
+        type=int,
+        default=3686400,  # 8294400 is 4k, 3686400 is 2k
+        help="maximum allowed pixel count for one image before resize preprocessing",
+    )
+    parser.add_argument(
+        "--disable_image_resize",
+        action="store_true",
+        help="disable automatic resize for images exceeding --max_image_pixels (enabled by default)",
+    )
+    parser.add_argument(
+        "--embed_cache_storage_size",
+        type=float,
+        default=4,
+        help="embed cache for swap multimodal data in llm and vit, whisper. 4G is default",
+    )
+    parser.add_argument(
+        "--data_type",
+        type=str,
+        choices=["fp16", "float16", "bf16", "bfloat16", "fp32", "float32"],
+        default=None,
+        help="the data type of the model weight",
+    )
+    parser.add_argument(
+        "--enable_prompt_logprobs",
+        action="store_true",
+        help="enable prompt top-k logprobs capture",
+    )
+
+    parser.add_argument("--use_reward_model", action="store_true", help="use reward model")
+
+    parser.add_argument("--use_tgi_api", action="store_true", help="use tgi input and ouput format")
+    parser.add_argument(
+        "--health_monitor", action="store_true", help="check the health of service and restart when error"
+    )
+    parser.add_argument("--metric_gateway", type=str, default=None, help="address for collecting monitoring metrics")
+    parser.add_argument("--job_name", type=str, default="lightllm", help="job name for monitor")
+    parser.add_argument(
+        "--grouping_key", action="append", default=[], help="grouping_key for the monitor in the form key=value"
+    )
+    parser.add_argument("--push_interval", type=int, default=10, help="interval of pushing monitoring metrics")
+    parser.add_argument(
+        "--visual_infer_batch_size", type=int, default=None, help="number of images to process in each inference batch"
+    )
+    parser.add_argument(
+        "--visual_send_batch_size",
+        type=int,
+        default=1,
+        help="""
+        number of images embedding to send to llm process in each batch,
+        bigger size can improve throughput but increase latency possibly in some cases
+        """,
+    )
+    parser.add_argument(
+        "--visual_gpu_ids", nargs="+", type=int, default=None, help="List of GPU IDs to use, e.g., 0 1 2"
+    )
+    parser.add_argument("--visual_tp", type=int, default=1, help="number of tensort parallel instances for ViT")
+    parser.add_argument("--visual_dp", type=int, default=1, help="number of data parallel instances for ViT")
+    parser.add_argument(
+        "--visual_rpyc_port",
+        type=int,
+        default=None,
+        help="""
+            when run_mode is visual_only, set this port, make others to call local visual infer to
+            transfer image to embed.
+            """,
+    )
+    parser.add_argument(
+        "--audio_gpu_ids", nargs="+", type=int, default=None, help="GPU IDs for audio encoder, e.g., 0 1 2"
+    )
+    parser.add_argument(
+        "--audio_tp",
+        type=int,
+        default=1,
+        help="Tensor parallel size for audio encoder (only 1 is supported; use audio_dp to scale)",
+    )
+    parser.add_argument("--audio_dp", type=int, default=1, help="Data parallel replicas for audio encoder")
+    parser.add_argument(
+        "--audio_infer_batch_size",
+        type=int,
+        default=None,
+        help="""
+        Max audio items per GPU infer batch in audio worker (default: max(4, audio_dp),
+        must be multiple of audio_dp)
+        """,
+    )
+    parser.add_argument(
+        "--visual_use_proxy_mode",
+        action="store_true",
+        help="""
+        when run_mode is normal, set this params,
+        will call remote visual infer to transfer image to embed,
+        need set --config_server_host, --config_server_port,
+        --config_server_visual_redis_port""",
+    )
+    parser.add_argument(
+        "--enable_monitor_auth", action="store_true", help="Whether to open authentication for push_gateway"
+    )
+    parser.add_argument("--disable_cudagraph", action="store_true", help="Disable the cudagraph of the decoding stage")
+    parser.add_argument(
+        "--enable_prefill_cudagraph",
+        action="store_true",
+        help="Enable the cudagraph of the prefill stage,"
+        " currently only for llama and qwen model, not support ep moe model",
+    )
+    parser.add_argument(
+        "--prefill_cudagraph_max_handle_token",
+        type=int,
+        default=8192,
+        help="max handle token num for prefill cudagraph",
+    )
+
+    parser.add_argument(
+        "--graph_max_batch_size",
+        type=int,
+        default=256,
+        help="""Maximum batch size that can be captured by the cuda graph for decodign stage.""",
+    )
+    parser.add_argument(
+        "--graph_split_batch_size",
+        type=int,
+        default=32,
+        help="""
+        Controls the interval for generating CUDA graphs during decoding.
+        CUDA graphs will be generated continuously for values ranging from 1 up to the specified
+        graph_split_batch_size. For values from graph_split_batch_size to graph_max_batch_size,
+        a new CUDA graph will be generated for every increment of graph_grow_step_size.
+        Properly configuring this parameter can help optimize the performance of CUDA graph execution.
+        """,
+    )
+    parser.add_argument(
+        "--graph_grow_step_size",
+        type=int,
+        default=16,
+        help="""
+        For batch_size values from graph_split_batch_size to graph_max_batch_size,
+        a new CUDA graph will be generated for every increment of graph_grow_step_size.
+        """,
+    )
+    parser.add_argument(
+        "--graph_max_len_in_batch",
+        type=int,
+        default=0,
+        help="""Maximum sequence length that can be captured by the cuda graph for decodign stage.
+                The default value is 8192. It will turn into eagar mode if encounters a larger value. """,
+    )
+    parser.add_argument(
+        "--quant_type",
+        type=str,
+        default="none",
+        help=(
+            "Quantization methods (W = weight, A = activation):\n"
+            "  quant_type                     quantization                           implementation backend\n"
+            "  w8a8                           INT8; W per-channel, A per-token       vLLM\n"
+            "  fp8w8a8                        FP8; W per-channel, A per-token        vLLM\n"
+            "  fp8w8a8-pt                     FP8; W per-tensor, A per-token         Triton\n"
+            "  fp8w8a8-b128                   FP8; W block 128x128, A group 128      Triton\n"
+            "  fp8w8a8g128                    FP8; W per-channel, A group 128        Triton\n"
+            "  fp8w8a8g64                     FP8; W per-channel, A group 64         Triton\n"
+            "  awq                            INT4 weight-only; checkpoint group     vLLM\n"
+            "  awq_marlin                     INT4 weight-only; checkpoint group     vLLM\n"
+            "  none                           No quantization                        -\n"
+            "  w8a8-vllm                      INT8; W per-channel, A per-token       vLLM\n"
+            "  fp8w8a8-vllm                   FP8; W per-channel, A per-token        vLLM\n"
+            "  fp8w8a8-pt-vllm                FP8; W per-tensor, A per-token         vLLM\n"
+            "  fp8w8a8-pt-sgl                 FP8; W per-tensor, A per-token         SGL\n"
+            "  fp8w8a8-pt-triton              FP8; W per-tensor, A per-token         Triton\n"
+            "  fp8w8a8-b128-vllm              FP8; W block 128x128, A group 128      vLLM\n"
+            "  fp8w8a8-b128-deepgemm          FP8; W block 128x128, A group 128      DeepGEMM\n"
+            "  fp8w8a8-b128-triton            FP8; W block 128x128, A group 128      Triton\n"
+            "  fp8w8a8g128-triton             FP8; W per-channel, A group 128        Triton\n"
+            "  fp8w8a8g64-triton              FP8; W per-channel, A group 64         Triton\n"
+            "  fp4fp8-b32-deepgemm            FP4/FP8; fused MoE experts only        DeepGEMM"
+        ),
+    )
+    parser.add_argument(
+        "--quant_cfg",
+        type=str,
+        default=None,
+        help="""Path of quantization config. It can be used for mixed quantization.
+            Examples can be found in test/advanced_config/mixed_quantization/llamacls-mix-down.yaml.""",
+    )
+    parser.add_argument(
+        "--expert_dtype",
+        type=str,
+        default=None,
+        choices=["fp8", "fp4"],
+        help="""Expert quantization dtype for EP MoE. Supported values are
+            fp8 and fp4. Note that fp4 is only supported on SM100 GPUs.""",
+    )
+    parser.add_argument(
+        "--vit_quant_type",
+        type=str,
+        default="none",
+        help="""Quantization method for ViT: w8a8 | fp8w8a8""",
+    )
+    parser.add_argument(
+        "--vit_quant_cfg",
+        type=str,
+        default=None,
+        help="""Path of quantization config. It can be used for mixed quantization.
+            Examples can be found in lightllm/common/quantization/configs.""",
+    )
+    parser.add_argument(
+        "--sampling_backend",
+        type=str,
+        choices=["triton", "flashinfer"],
+        default="triton",
+        help="""sampling used impl. 'triton' is use torch and triton kernel,
+        flashinfer use flashinfer sampling impl""",
+    )
+    parser.add_argument(
+        "--penalty_counter_mode",
+        type=str,
+        choices=["cpu_counter", "pin_mem_counter", "gpu_counter"],
+        default="gpu_counter",
+        help=(
+            "During inference with large models, it is necessary to track the frequency of input token_ids."
+            " Three recording modes are currently supported:\n"
+            "- **cpu_counter**: This mode does not consume GPU memory"
+            " and is suitable for short outputs and low concurrency scenarios."
+            " However, for long outputs or high concurrency, it may introduce"
+            " significant CPU overhead, leading to severe performance degradation.\n"
+            "- **pin_mem_counter**: This mode allocates a large batch of pinned memory"
+            " to manage the counter and interacts with some CUDA kernels."
+            " While it does not consume GPU memory, it may introduce a certain performance bottleneck.\n"
+            "- **gpu_counter**: This mode achieves operations by allocating a large GPU buffer, providing"
+            " the highest performance but consuming a significant amount of GPU memory."
+            " Therefore, it is recommended to set this parameter according to actual needs."
+        ),
+    )
+    parser.add_argument(
+        "--enable_ep_moe",
+        action="store_true",
+        help="""Whether to enable ep moe for deepseekv3 model.""",
+    )
+    parser.add_argument(
+        "--ep_redundancy_expert_config_path",
+        type=str,
+        default=None,
+        help="""Path of the redundant expert config. It can be used for deepseekv3 model.""",
+    )
+    parser.add_argument(
+        "--auto_update_redundancy_expert",
+        action="store_true",
+        help="""Whether to update the redundant expert for deepseekv3 model by online expert used counter.""",
+    )
+    parser.add_argument(
+        "--enable_fused_shared_experts",
+        action="store_true",
+        help="""Whether to enable fused shared experts for supported MoE models. It is auto-enabled when supported.""",
+    )
+    parser.add_argument(
+        "--mtp_mode",
+        choices=[
+            "vanilla_with_att",
+            "eagle_with_att",
+            "vanilla_no_att",
+            "eagle_no_att",
+            "eagle3",
+            "dspark",
+            "dflash",
+            "dflash2",
+            None,
+        ],
+        default=None,
+        help="""Speculative decoding mode.
+        *_with_att and *_no_att select attention or non-attention draft models;
+        eagle3 uses autoregressive EAGLE-3 drafting; dflash uses block-diffusion drafting;
+        dflash2 uses block-diffusion drafting with local convolutions and candidate reranking;
+        dspark uses semi-autoregressive parallel drafting.""",
+    )
+    parser.add_argument(
+        "--mtp_draft_model_dir",
+        type=str,
+        nargs="+",
+        default=None,
+        help="""Path to the speculative draft model. The legacy option name is
+        retained for command-line compatibility.""",
+    )
+    parser.add_argument(
+        "--mtp_step",
+        type=int,
+        default=0,
+        help="""Number of additional draft tokens per request.
+        For DSpark and DFlash this value is derived from the draft checkpoint block_size.""",
+    )
+    parser.add_argument(
+        "--mtp_dynamic_verify",
+        action="store_true",
+        help="""Enable dynamic speculative scheduling.""",
+    )
+    parser.add_argument(
+        "--kv_quant_calibration_config_path",
+        type=str,
+        default=None,
+        help="""Path of the kv quant calibration config. It can be used for llama and qwen model.""",
+    )
+    parser.add_argument(
+        "--schedule_time_interval",
+        type=float,
+        default=0.03,
+        help="""The interval of the schedule time, default is 30ms.""",
+    )
+    parser.add_argument(
+        "--afs_image_embed_dir",
+        type=str,
+        default=None,
+        help="path for vit embed, when use vit remote infer mode",
+    )
+    parser.add_argument(
+        "--afs_embed_capacity",
+        type=int,
+        default=250000,
+        help="""
+        capacity for vit embed in remote infer mode,
+        it control how many image can be cached in afs,
+        when the cache is full, the least recently used
+        image embed will be removed""",
+    )
+    parser.add_argument(
+        "--enable_cpu_cache",
+        action="store_true",
+        help="""enable cpu cache to store kv cache. prefer to use hugepages for better performance.
+        For linear attention cache reuse constraints, cpu cache token page size will be forced to
+        linear_att_page_block_num * linear_att_hash_page_size when cpu cache is enabled.""",
+    )
+    parser.add_argument(
+        "--cpu_cache_storage_size",
+        type=float,
+        default=2,
+        help="""The capacity of cpu cache. GB used.""",
+    )
+    parser.add_argument(
+        "--cpu_cache_token_page_size",
+        type=int,
+        default=None,
+        help="""The token page size of cpu cache. Non-hybrid models default to 256.
+        Hybrid models use linear_att_hash_page_size * linear_att_page_block_num;
+        configure --linear_att_page_block_num to set their checkpoint interval.""",
+    )
+    parser.add_argument(
+        "--cache_placement_strategy",
+        type=str,
+        choices=["adaptive", "legacy"],
+        default="adaptive",
+        help="""Cache placement strategy used when CPU cache is enabled.
+        adaptive: place requests between GPU and the lower-tier cache path based on recent input lengths and capacity;
+        Disk placement is offloaded through CPU cache, so CPU and Disk capacities are not additive.
+        legacy: retain GPU cache and also copy each request to every enabled lower cache level.""",
+    )
+    parser.add_argument("--enable_disk_cache", action="store_true", help="""enable disk cache to store kv cache.""")
+    parser.add_argument(
+        "--disk_cache_storage_size", type=float, default=10, help="""The capacity of disk cache. GB used."""
+    )
+    parser.add_argument(
+        "--enable_rl",
+        action="store_true",
+        default=False,
+        help="""enable RL control plane (HTTP APIs, router rl_rpyc, model RlBackendOps).
+        When disabled (default), RL routes/services are not started.""",
+    )
+    parser.add_argument(
+        "--enable_torch_memory_saver",
+        action="store_true",
+        help="""enable torch memory saver, which is used for release_memory and resume_memory during RL training.""",
+    )
+    parser.add_argument("--enable_weight_cpu_backup", action="store_true", help="""enable weight cpu backup.""")
+    parser.add_argument(
+        "--disk_cache_dir",
+        type=str,
+        default=None,
+        help="""Directory used to persist disk cache data. Defaults to a temp directory when not set.""",
+    )
+    parser.add_argument(
+        "--enable_dp_prompt_cache_fetch",
+        action="store_true",
+        default=False,
+        help="""Enable prefix prompt cache fetch for data parallel inference, disabled by default.""",
+    )
+    parser.add_argument(
+        "--linear_att_hash_page_size",
+        type=int,
+        default=512,
+        help="""The hash page size for linear attention.
+        It controls the number of tokens in each hash bucket, which can affect radix cache reused""",
+    )
+    parser.add_argument(
+        "--linear_att_page_block_num",
+        type=int,
+        default=10000000,
+        help="""The number of blocks for linear attention state storage.
+        It controls the number of pages used for storing the attention state,
+        which can affect memory usage and mutiturn chat performance.
+        Block size is linear_att_page_block_num * linear_att_hash_page_size.
+        When this value multiplied by linear_att_hash_page_size is greater than max_req_total_len,
+        block-level matching in radix cache is effectively disabled and request-level small-page
+        matching (linear_att_hash_page_size) may dominate.""",
+    )
+    parser.add_argument(
+        "--linear_att_cache_size",
+        type=int,
+        default=None,
+        help="""The size of linear attn cache.
+        If radix cache hit rate is low under high load due to limited small-page capacity and LRU
+        eviction, increasing linear_att_cache_size can improve hit rate at the cost of more memory.""",
+    )
+    parser.add_argument(
+        "--ssm_state_mode",
+        choices=["native", "replay"],
+        default="native",
+        help="SSM state storage: native snapshots or deferred GDN/KDA ReplaySSM (FP32/BF16).",
+    )
+    parser.add_argument(
+        "--ssm_replay_config",
+        type=json.loads,
+        default={},
+        help='Replay-only JSON object: {"cache_len":16,"compute_mode":"precompute"}. '
+        "cache_len: 4/8/16/32/64, at least the verify width; compute_mode: inline/precompute. "
+        "mtp_step=0 decode uses the same replay history: explicit precompute projects that one token, "
+        "and the default is inline. MTP defaults to precompute.",
+    )
+    parser.add_argument(
+        "--linear_att_ssm_data_type",
+        type=str,
+        choices=["bfloat16", "float32"],
+        default="float32",
+        help="the data type of linear att smm data type",
+    )
+    parser.add_argument(
+        "--disable_linear_att_small_page_cpu_cache",
+        action="store_true",
+        default=False,
+        help="""Disable storing linear attention small page data in CPU cache.
+        This reduces CPU cache memory waste but also decreases the hit length.""",
+    )
+    parser.add_argument(
+        "--hardware_platform",
+        type=str,
+        default="cuda",
+        choices=["cuda", "musa"],
+        help="""Hardware platform: cuda | musa""",
+    )
+    parser.add_argument(
+        "--enable_torch_fallback",
+        action="store_true",
+        help="""Whether to enable torch naive implementation for the op.
+        If the op is not implemented for the platform, it will use torch naive implementation.""",
+    )
+    parser.add_argument(
+        "--enable_triton_fallback",
+        action="store_true",
+        help="""Whether to enable triton implementation for the op.
+        If the op is not implemented for the platform and the hardware support triton,
+        it will use triton implementation.""",
+    )
+    parser.add_argument(
+        "--enable_return_routed_experts",
+        action="store_true",
+        default=False,
+        help="Enable returning routed expert indices for MoE models (R3 feature).",
+    )
+    parser.add_argument(
+        "--enable_profiling",
+        type=str,
+        choices=["torch_profiler", "nvtx"],
+        default=None,
+        help="""Enable profiler support.
+                This will expose '/profiler_start' and '/profiler_stop' API,
+                below profiling features will only be enabled in this range.
+                Options:
+                'torch_profiler': will setup torch.profiler.profile(), trace files will be saved to './trace',
+                or set by 'LIGHTLLM_TRACE_DIR' env;
+                'nvtx': will add NVTX marks for external profiler like NVIDIA Nsight System
+                (you should set it up by yourself).
+                A NVTX range named 'LIGHTLLM_PROFILE' will be added within the profiling range.""",
+    )
+    return parser
+
+
+def make_argument_parser() -> argparse.ArgumentParser:
+    return add_cli_args(argparse.ArgumentParser())

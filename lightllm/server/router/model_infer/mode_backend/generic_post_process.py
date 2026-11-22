@@ -1,0 +1,381 @@
+import torch
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
+from lightllm.common.basemodel.triton_kernel.post_process.apply_penalty import apply_penalty
+from lightllm.common.basemodel.triton_kernel.post_process.apply_penalty_gpu_cache import apply_penalty_gpu_cache
+from lightllm.common.basemodel.triton_kernel.post_process.apply_invalid_token import apply_invalid_token_ids
+from lightllm.common.basemodel.triton_kernel.logprobs_capture import capture_output_logprobs
+from lightllm.common.basemodel.triton_kernel.post_process.apply_constraint_mask import apply_constraint_mask
+from lightllm.common.basemodel.triton_kernel.local_vocab_topk import local_vocab_greedy_logprob
+from lightllm.server.router.model_infer.infer_batch import InferReq, g_infer_context
+from lightllm.server.router.model_infer.pin_mem_manager import g_pin_mem_manager
+from lightllm.utils.envs_utils import get_env_start_args
+
+
+@dataclass
+class TopkLogprobRow:
+    """一行 top-k 候选。token_ids 与 logprobs 等长，按分数从高到低对齐。
+
+    batch_index 是该行在本次采样 logits 中的下标。返回列表与 logits 行对齐，未请求 logprobs 的位置是 None。
+    """
+
+    batch_index: int
+    token_ids: torch.Tensor
+    logprobs: torch.Tensor
+
+
+TopkLogprobRows = List[Optional[TopkLogprobRow]]
+
+
+def sample(
+    logits: torch.Tensor,
+    reqs: List[InferReq],
+    eos_id: List[int] = [2],
+    has_output=None,
+    b_mtp_index: Optional[torch.Tensor] = None,
+):
+    sampling_params_manager = g_infer_context.req_manager.req_sampling_params_manager
+    (
+        b_req_idx,
+        b_temperatures,
+        b_top_ps,
+        b_top_ks,
+        b_length_penalty_param,
+        b_mask_eos_reqs,
+        invalid_token_ids,
+        cu_invalid_token_num,
+        is_all_greedy,
+        has_invalid_token_ids,
+        skip_top_k,
+        skip_top_p,
+        exist_req_use_random_seed,
+        has_output_constraints,
+    ) = _get_post_sample_tensors(reqs, sampling_params_manager, has_output)
+    eos_ids = g_pin_mem_manager.gen_from_list(key="eos_ids", data=eos_id, dtype=torch.int32).cuda(non_blocking=True)
+
+    # 这里需要区分历史token的频率惩罚类的系数的生效模式，目前支持两种在线统计方式:
+    # 一种是基于 cpu 的，每个 req 对象利用其上绑定的dict对象out_token_id_count，每生成一个token就进行相应
+    # 的计数更新，当进行使用的时候, 对一个需要处理的req list, 会生成对应的3个 triton kernel 需要使用的惩罚系数
+    # 输入参数  p_token_ids, p_token_counts, p_cumsum_seq_len，这种方式的特点是占用的显存少，在请求输出不长的时候，
+    # 速度快且没有代价，但是目前 RL 采样场景下，需要进行大量的长输出生成，这时候，cpu进行的处理操作会形成一些瓶颈，影响
+    # 推理的速度。
+    # 一种是基于 gpu buffer的，每个请求都会被分配一个 vocab_size 大小的 cuda tensor 用于出现过的token进行计数，
+    # 然后在直接使用 triton kernel 在对应的logits上进行相应的惩罚操作，这种方法的特点是，处理速度快，但是需要预先
+    # 分配较大的显存空间用于token的计数，如果以常见的词表大小 vocab_size = 500000, 预分配1000个请求的cuda tensor，
+    # 使用int32类型进行计数大概需要600M的空间，这也不是一笔不菲的开销。
+    # 所以需要根据具体的显卡，使用场景，来判断使用那种方式，默认情况下 为gpu模式，可以调整args.penalty_counter_mode
+    # 参数来控制使用方式。
+    if sampling_params_manager.penalty_counter_mode == "cpu_counter":
+        (
+            p_token_ids,
+            p_token_counts,
+            p_cumsum_seq_len,
+        ) = sampling_params_manager.gen_cpu_out_token_counter_sampling_params(req_objs=reqs)
+
+        apply_penalty(
+            Logits=logits,
+            b_req_idx=b_req_idx,
+            b_length_penalty_param=b_length_penalty_param,
+            b_mask_eos_reqs=b_mask_eos_reqs,
+            p_token_ids=p_token_ids,
+            p_token_counts=p_token_counts,
+            p_cumsum_seq_len=p_cumsum_seq_len,
+            eos_ids=eos_ids,
+            sampling_params_manager=sampling_params_manager,
+        )
+    else:
+        apply_penalty_gpu_cache(
+            Logits=logits,
+            b_req_idx=b_req_idx,
+            b_length_penalty_param=b_length_penalty_param,
+            b_mask_eos_reqs=b_mask_eos_reqs,
+            eos_ids=eos_ids,
+            sampling_params_manager=sampling_params_manager,
+        )
+
+    if has_invalid_token_ids:
+        apply_invalid_token_ids(
+            Logits=logits,
+            invalid_token_ids=invalid_token_ids,
+            cu_invalid_token_num=cu_invalid_token_num,
+        )
+
+    logits.div_(b_temperatures.view((-1, 1)))
+    # Apply hard constraints after all penalties. In particular, the EOS length
+    # penalty must not turn a masked -inf into NaN or re-enable a forbidden EOS.
+    if has_output_constraints:
+        # 在当前采样流上异步传输掩码，后续 kernel 按流顺序读取 GPU 数据。
+        apply_constraint_mask(
+            logits=logits,
+            b_req_idx=b_req_idx,
+            req_to_bitmask=sampling_params_manager.req_to_bitmask.cuda(non_blocking=True),
+            req_to_bitmask_enabled=sampling_params_manager.req_to_bitmask_enabled.cuda(non_blocking=True),
+            vocab_size=sampling_params_manager.vocab_size,
+            b_mtp_index=b_mtp_index,
+        )
+    if is_all_greedy:
+        next_token_ids, next_token_logprobs = local_vocab_greedy_logprob(logits)
+    else:
+        probs = torch.softmax(logits, dim=-1)
+        if skip_top_k and skip_top_p:
+            next_token_ids = _random_sample(probs, reqs, exist_req_use_random_seed)
+            next_token_logprobs = probs.gather(1, next_token_ids.view(-1, 1)).log().view(-1)
+        else:
+            next_token_ids, next_token_logprobs = _top_p_top_k_sample(
+                reqs, probs, b_top_ps, b_top_ks, exist_req_use_random_seed
+            )
+
+    output_topk_logprobs: TopkLogprobRows = [None] * len(reqs)
+    topk_logprobs_rows, max_topk = _collect_topk_logprobs_rows(reqs=reqs, has_output=has_output)
+    if topk_logprobs_rows:
+        next_token_logprobs, output_topk_logprobs = _capture_topk_logprobs(
+            logits=logits,
+            next_token_ids=next_token_ids,
+            next_token_logprobs=next_token_logprobs,
+            topk_logprobs_rows=topk_logprobs_rows,
+            max_topk=max_topk,
+        )
+    return next_token_ids, next_token_logprobs, output_topk_logprobs
+
+
+def _collect_topk_logprobs_rows(
+    reqs: List[InferReq], has_output: Optional[List[bool]] = None
+) -> Tuple[List[Tuple[int, int]], int]:
+    """Rows that asked for candidate topk logprobs, as (batch_index, topk), plus the maximum topk.
+
+    topk == 0 still runs the fixed top-20 cutoff on the sampled logprob and writes no candidates.
+    batch_index is the position in the original reqs and logits. max_topk is 0 when the list is empty.
+    """
+    rows = []
+    max_topk = 0
+    for batch_index, req_obj in enumerate(reqs):
+        topk = req_obj.sampling_param.shm_param.output_top_logprobs
+        # topk == 0 也要进来：没有候选列表，但仍要把落在前 20 名之外的采样 logprob 写成 -9999。
+        if topk >= 0 and (has_output is None or has_output[batch_index]):
+            rows.append((batch_index, topk))
+            max_topk = max(max_topk, topk)
+    return rows, max_topk
+
+
+def _capture_topk_logprobs(
+    logits: torch.Tensor,
+    next_token_ids: torch.Tensor,
+    next_token_logprobs: torch.Tensor,
+    topk_logprobs_rows: List[Tuple[int, int]],
+    max_topk: int,
+) -> Tuple[torch.Tensor, TopkLogprobRows]:
+    capture_rows = []
+    output_count = 0
+    for batch_index, topk in topk_logprobs_rows:
+        capture_rows.append((batch_index, topk, output_count))
+        output_count += topk
+
+    rows = g_pin_mem_manager.alloc_pin_tensor("output_logprob_rows", 3 * len(capture_rows), torch.int32).view(-1, 3)
+    rows.numpy()[:] = capture_rows
+    token_ids, logprobs = capture_output_logprobs(
+        logits=logits,
+        sampled_ids=next_token_ids,
+        sampled_logprobs=next_token_logprobs,
+        rows=rows.to(device=logits.device, non_blocking=True),
+        max_topk=max_topk,
+        output_count=output_count,
+    )
+    token_ids_cpu = g_pin_mem_manager.async_copy_from_gpu_tensor(key="output_topk_token_ids", gpu_tensor=token_ids)
+    logprobs_cpu = g_pin_mem_manager.async_copy_from_gpu_tensor(key="output_topk_logprobs", gpu_tensor=logprobs)
+    topk_rows: TopkLogprobRows = [None] * logits.shape[0]
+    offset = 0
+    for batch_index, topk in topk_logprobs_rows:
+        # topk == 0 只参与上面的采样分数改写，不返回候选。
+        if topk > 0:
+            topk_rows[batch_index] = TopkLogprobRow(
+                batch_index=batch_index,
+                token_ids=token_ids_cpu[offset : offset + topk],
+                logprobs=logprobs_cpu[offset : offset + topk],
+            )
+        offset += topk
+    return next_token_logprobs, topk_rows
+
+
+def _top_p_top_k(probs: torch.Tensor, top_ps: torch.Tensor, top_ks: torch.Tensor):
+    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
+
+    probs_sort[torch.arange(0, probs.shape[-1], device="cuda").view(1, -1) >= top_ks.view(-1, 1)] = 0.0
+
+    return probs_sort, probs_idx
+
+
+def _top_p_top_k_sample(
+    reqs: List[InferReq],
+    probs: torch.Tensor,
+    b_top_ps: torch.Tensor,
+    b_top_ks: torch.Tensor,
+    exist_req_use_random_seed: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    sampling_backend = get_env_start_args().sampling_backend
+
+    if sampling_backend == "triton":
+        probs_sort, probs_idx = _top_p_top_k(probs, b_top_ps, b_top_ks)
+        if not exist_req_use_random_seed:
+            sampled_index = torch.multinomial(probs_sort, num_samples=1, replacement=True)
+        else:
+            sampled_index = _random_sample(probs_sort, reqs, exist_req_use_random_seed).view(-1, 1)
+        next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index)
+        next_token_logprobs = torch.log(torch.gather(probs_sort, dim=1, index=sampled_index))
+        return next_token_ids.view(-1), next_token_logprobs.view(-1)
+
+    elif sampling_backend == "flashinfer":
+        from flashinfer.sampling import top_k_top_p_sampling_from_probs
+
+        batch_next_token_ids = top_k_top_p_sampling_from_probs(
+            probs,
+            b_top_ks,
+            b_top_ps,
+            filter_apply_order="joint",
+            check_nan=False,
+        )
+        int64_batch_next_token_ids = torch.empty_like(batch_next_token_ids, dtype=torch.int64)
+        int64_batch_next_token_ids[:] = batch_next_token_ids
+        batch_next_token_probs = torch.gather(probs, dim=1, index=int64_batch_next_token_ids.view(-1, 1))
+        return batch_next_token_ids.view(-1), torch.log(batch_next_token_probs).view(-1)
+    else:
+        assert False, "Unsupported sampling backend for top_p_top_k_sample"
+
+
+def _random_sample(probs: torch.Tensor, reqs: List[InferReq], exist_req_use_random_seed: bool):
+    q = torch.empty_like(probs)
+    q.exponential_()
+    if exist_req_use_random_seed:
+        for i, req in enumerate(reqs):
+            if req.generator is not None:
+                q[i].exponential_(generator=req.generator)
+    return probs.div(q).argmax(dim=-1).view(-1)
+
+
+def _get_post_sample_tensors(reqs: List[InferReq], sampling_params_manager, has_output=None):
+    """Collect per-logit sampling parameters and fill each request's masks once."""
+    req_idxes: List[int] = []
+    temperatures: List[float] = []
+    top_ps: List[float] = []
+    top_ks: List[int] = []
+    length_penalty_param: List[int] = []
+    mask_eos_reqs: List[bool] = []
+    is_all_greedy = True
+    skip_top_k = True
+    skip_top_p = True
+    exist_req_use_random_seed = False
+    has_output_constraints = False
+    # 仅在服务启用 XGrammar 输出约束时，按请求分组并为 MTP 验证位置准备语法掩码。
+    if sampling_params_manager.req_to_bitmask_enabled is not None:
+        request_groups = _group_contiguous_requests(reqs, has_output)
+        for request_group in request_groups:
+            has_output_constraints |= _prepare_output_constraint_mask(
+                request_group=request_group,
+                sampling_params_manager=sampling_params_manager,
+            )
+
+    # invalid token ids
+    invalid_token_ids: List[int] = []
+    has_invalid_token_ids = False
+    cu_invalid_token_num = [0]
+    invalid_token_num_start = 0
+
+    for i, req_obj in enumerate(reqs):
+        sample_param = req_obj.sampling_param
+        shm_param = sample_param.shm_param
+        exponential_decay_length_penalty = shm_param.exponential_decay_length_penalty.to_tuple()
+        out_token_len = req_obj.get_cur_total_len() - req_obj.shm_req.input_len
+        length_penalty_param.append(max(out_token_len - exponential_decay_length_penalty[0], 0))
+        mask_eos_reqs.append(out_token_len < shm_param.min_new_tokens - 1)
+
+        temperatures.append(shm_param.temperature)
+        top_ps.append(shm_param.top_p)
+        top_k_val = shm_param.top_k
+        top_ks.append(top_k_val)
+        if top_k_val > 1:
+            is_all_greedy = False
+        if top_k_val != req_obj.vocab_size:
+            skip_top_k = False
+        if shm_param.top_p != 1.0:
+            skip_top_p = False
+        if req_obj.generator is not None:
+            exist_req_use_random_seed = True
+        req_idxes.append(req_obj.req_idx)
+        invalid_token_num_start += len(req_obj.sampling_param.invalid_token_ids)
+        cu_invalid_token_num.append(invalid_token_num_start)
+        if len(req_obj.sampling_param.invalid_token_ids) > 0:
+            has_invalid_token_ids = True
+            invalid_token_ids.extend(req_obj.sampling_param.invalid_token_ids)
+
+    req_idxes_cpu = g_pin_mem_manager.gen_from_list(key="req_idxes", data=req_idxes, dtype=torch.int32)
+    temperatures_cpu = g_pin_mem_manager.gen_from_list(key="temperatures", data=temperatures, dtype=torch.float32)
+    top_ps_cpu = g_pin_mem_manager.gen_from_list(key="top_ps", data=top_ps, dtype=torch.float32)
+    top_ks_cpu = g_pin_mem_manager.gen_from_list(key="top_ks", data=top_ks, dtype=torch.int32)
+    length_penalty_param_cpu = g_pin_mem_manager.gen_from_list(
+        key="length_penalty_param", data=length_penalty_param, dtype=torch.int32
+    )
+    mask_eos_reqs_cpu = g_pin_mem_manager.gen_from_list(key="mask_eos_reqs", data=mask_eos_reqs, dtype=torch.bool)
+
+    if has_invalid_token_ids:
+        invalid_token_ids_cpu = g_pin_mem_manager.gen_from_list(
+            key="invalid_token_ids", data=invalid_token_ids, dtype=torch.int32
+        )
+        cu_invalid_token_num_cpu = g_pin_mem_manager.gen_from_list(
+            key="cu_invalid_token_num", data=cu_invalid_token_num, dtype=torch.int32
+        )
+
+    return (
+        req_idxes_cpu.cuda(non_blocking=True),
+        temperatures_cpu.cuda(non_blocking=True),
+        top_ps_cpu.cuda(non_blocking=True),
+        top_ks_cpu.cuda(non_blocking=True),
+        length_penalty_param_cpu.cuda(non_blocking=True),
+        mask_eos_reqs_cpu.cuda(non_blocking=True),
+        invalid_token_ids_cpu.cuda(non_blocking=True) if has_invalid_token_ids else None,
+        cu_invalid_token_num_cpu.cuda(non_blocking=True) if has_invalid_token_ids else None,
+        is_all_greedy,
+        has_invalid_token_ids,
+        skip_top_k,
+        skip_top_p,
+        exist_req_use_random_seed,
+        has_output_constraints,
+    )
+
+
+def _group_contiguous_requests(reqs: List[InferReq], has_output=None) -> List[List[Tuple[InferReq, bool]]]:
+    """Group contiguous rows as (request, has_output) pairs."""
+    groups = []
+    for index, req_obj in enumerate(reqs):
+        row_has_output = True if has_output is None else bool(has_output[index])
+        row = (req_obj, row_has_output)
+        if groups and groups[-1][0][0] is req_obj:
+            groups[-1].append(row)
+        else:
+            groups.append([row])
+    return groups
+
+
+def _prepare_output_constraint_mask(request_group, sampling_params_manager) -> bool:
+    """Prepare one request group's verify masks and report whether masking is active."""
+    if sampling_params_manager.req_to_bitmask_enabled is None:
+        return False
+
+    req_obj, has_output = request_group[0]
+    group_size = len(request_group)
+    enabled = False
+    state = req_obj.output_constraint
+    if state is not None and not req_obj.finish_status.is_finished() and has_output:
+        # 上一轮 post_handle 的 CUDA event 已等待 GPU 主表到 CPU 快照的拷贝完成。
+        # 第 0 列是已提交 token，后续列才是需要临时推进状态机的 draft。
+        draft_tokens = (
+            sampling_params_manager.req_to_next_token_ids_cpu[req_obj.req_idx, 1:group_size].tolist()
+            if group_size > 1
+            else []
+        )
+        enabled = state.fill_masks(sampling_params_manager.req_to_bitmask[req_obj.req_idx, :group_size], draft_tokens)
+
+    # Clear slots reused by ordinary or partial requests as well.
+    sampling_params_manager.req_to_bitmask_enabled[req_obj.req_idx] = enabled
+    return enabled

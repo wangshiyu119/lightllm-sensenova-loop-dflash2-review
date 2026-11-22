@@ -1,0 +1,77 @@
+from lightllm.utils.log_utils import init_logger
+from typing import Optional
+
+logger = init_logger(__name__)
+
+SERVER_BUSY_MESSAGE = "Server is busy, please try again later"
+
+
+class InvalidRequestError(ValueError):
+    """Request validation failed before generation started."""
+
+
+class GenerationError(Exception):
+    """Generation stopped because of an internal server failure."""
+
+
+class ServerBusyError(Exception):
+    """Custom exception for server busy/overload situations"""
+
+    def __init__(self, message=SERVER_BUSY_MESSAGE, status_code=429):
+        """
+        Initialize the ServerBusyError
+
+        Args:
+            message (str): Error message to display
+            status_code (int): HTTP status code (default 429 Too Many Requests)
+        """
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code  # HTTP 429 Too Many Requests
+
+    def __str__(self):
+        """String representation of the error"""
+        return f"{self.message} (Status code: {self.status_code})"
+
+
+class ClientDisconnected(Exception):
+    """Raised when the client closed the HTTP connection mid-request, as
+    detected by ``request.is_disconnected()``. This is an expected control-flow
+    signal — handlers should clean up quietly without logging a stack trace.
+    Internal-module aborts (e.g. visual proxy failures) must NOT raise this —
+    they should surface as real server errors."""
+
+    def __init__(self, group_request_id: Optional[int] = None, reason: str = "client disconnected"):
+        prefix = f"req_id {group_request_id} " if group_request_id is not None else ""
+        super().__init__(f"{prefix}{reason}")
+        self.group_request_id = group_request_id
+        self.reason = reason
+
+
+class PDPrefillNodeStopGenToken(Exception):
+    def __init__(self, group_request_id, message="PD prefill node stop gen token"):
+        """
+        Initialize the PDPrefillNodeStopGenToken
+
+        Args:
+            message (str): Error message to display
+        """
+        super().__init__(message)
+        self.message = message
+        self.group_request_id = group_request_id
+
+    def __str__(self):
+        """String representation of the error"""
+        return f"group_request_id: {self.group_request_id}, {self.message}"
+
+
+def log_exception(func):
+    def wrapper(*args, **kwargs):
+        try:
+            result = func(*args, **kwargs)
+        except BaseException as e:
+            logger.exception(str(e))
+            raise e
+        return result
+
+    return wrapper

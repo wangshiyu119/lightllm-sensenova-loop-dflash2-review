@@ -1,0 +1,417 @@
+import os
+import json
+import uuid
+from easydict import EasyDict
+from functools import lru_cache
+from lightllm.utils.log_utils import init_logger
+
+
+logger = init_logger(__name__)
+
+
+def set_unique_server_name(args):
+    node_uuid = uuid.uuid4().hex[0:16]
+
+    if args.run_mode == "pd_master":
+        os.environ["LIGHTLLM_UNIQUE_SERVICE_NAME_ID"] = str(node_uuid) + "_pd_master"
+    else:
+        os.environ["LIGHTLLM_UNIQUE_SERVICE_NAME_ID"] = str(node_uuid) + "_" + str(args.node_rank)
+    return
+
+
+@lru_cache(maxsize=None)
+def get_unique_server_name():
+    service_uni_name = os.getenv("LIGHTLLM_UNIQUE_SERVICE_NAME_ID")
+    return service_uni_name
+
+
+def set_cuda_arch(args):
+    import torch
+
+    if not torch.cuda.is_available():
+        return
+    return
+
+
+def set_env_start_args(args):
+    set_cuda_arch(args)
+    if not isinstance(args, dict):
+        args = vars(args)
+    os.environ["LIGHTLLM_START_ARGS"] = json.dumps(args)
+    return
+
+
+@lru_cache(maxsize=None)
+def get_env_start_args():
+    from lightllm.server.core.objs.start_args_type import StartArgs
+
+    start_args: StartArgs = json.loads(os.environ["LIGHTLLM_START_ARGS"])
+    start_args: StartArgs = EasyDict(start_args)
+    return start_args
+
+
+@lru_cache(maxsize=None)
+def get_model_infer_recursion_limit() -> int:
+    return int(os.getenv("LIGHTLLM_MODEL_INFER_RECURSION_LIMIT", "4000"))
+
+
+@lru_cache(maxsize=None)
+def get_llm_data_type():
+    import torch
+
+    data_type: str = get_env_start_args().data_type
+    if data_type in ["fp16", "float16"]:
+        data_type = torch.float16
+    elif data_type in ["bf16", "bfloat16"]:
+        data_type = torch.bfloat16
+    elif data_type in ["fp32", "float32"]:
+        data_type = torch.float32
+    else:
+        raise ValueError(f"Unsupported datatype {data_type}!")
+    return data_type
+
+
+@lru_cache(maxsize=None)
+def enable_env_vars(args):
+    return os.getenv(args, "False").upper() in ["ON", "TRUE", "1"]
+
+
+def get_env_use_ue8m0_scales() -> bool:
+    return os.getenv("LIGHTLLM_USE_UE8M0_SCALES", "0").upper() in ["ON", "TRUE", "1"]
+
+
+@lru_cache(maxsize=None)
+def is_stop_matching_in_reasoning_enabled() -> bool:
+    """是否允许用户配置的 stop 在 reasoning 阶段参与匹配。"""
+    return os.getenv("LIGHTLLM_STOP_IN_REASONING", "False").upper() in ["ON", "TRUE", "1"]
+
+
+@lru_cache(maxsize=None)
+def get_deepep_num_max_dispatch_tokens_per_rank_prefill():
+    # normal/prefill 模式在单卡最大 prefill batch 之外额外保留 128 个 token；
+    # decode 节点的 batch_max_tokens 已按本地请求容量重写，check max len
+    # 只需与 decode 相同的 12 个 token 余量。最后向上对齐到 8，
+    # 避免 autotune warmup 或调度边界波动使实际输入超过 DeepEP buffer 上限。
+    # 显式设置 NUM_MAX_DISPATCH_TOKENS_PER_RANK_PREFILL 时仍使用该覆盖值。
+    configured = os.getenv("NUM_MAX_DISPATCH_TOKENS_PER_RANK_PREFILL", None)
+    if configured is not None:
+        return int(configured)
+
+    args = get_env_start_args()
+    batch_max_tokens = args.batch_max_tokens or 256
+    safety_margin = 12 if args.run_mode == "decode" else 128
+    capacity = ((int(batch_max_tokens) + safety_margin + 7) // 8) * 8
+    logger.info(
+        "DeepEP prefill buffer capacity: batch_max_tokens=%s, safety_margin=%s, capacity=%s",
+        batch_max_tokens,
+        safety_margin,
+        capacity,
+    )
+    return capacity
+
+
+@lru_cache(maxsize=None)
+def get_deepep_num_max_dispatch_tokens_per_rank_decode():
+    # DeepEP 的 num_max_tokens_per_rank 是每个源 rank 的最大输入 token 数，
+    # 不是 HTTP 层的全局请求容量。混合注意力模型在 DP 下会把
+    # running_max_req_size 拆到本机各 DP rank，必须使用和调度器相同的
+    # per-DP 容量，否则会按全局容量过度分配 DeepEP buffer，挤占 KV cache。
+    # 每个请求最多产生 mtp_step + 1 个 verify token；额外保留 12 个 token
+    # 处理调度和 CUDA Graph 的边界波动，最后向上对齐到 DeepEP 要求的 8。
+    # 显式设置 NUM_MAX_DISPATCH_TOKENS_PER_RANK_DECODE 时仍使用该覆盖值。
+    configured = os.getenv("NUM_MAX_DISPATCH_TOKENS_PER_RANK_DECODE", None)
+    if configured is not None:
+        return int(configured)
+
+    args = get_env_start_args()
+    # Import lazily to avoid the config_utils -> envs_utils import cycle.
+    from lightllm.utils.config_utils import get_running_max_req_size_per_dp
+
+    request_capacity = get_running_max_req_size_per_dp(args)
+
+    required_tokens = int(request_capacity) * (int(args.mtp_step) + 1)
+    capacity = ((required_tokens + 12 + 7) // 8) * 8
+    logger.info(
+        "DeepEP decode buffer capacity: running_max_req_size=%s, request_capacity=%s, "
+        "mtp_step=%s, required_tokens=%s, safety_margin=12, capacity=%s",
+        args.running_max_req_size,
+        request_capacity,
+        args.mtp_step,
+        required_tokens,
+        capacity,
+    )
+    return capacity
+
+
+@lru_cache(maxsize=None)
+def get_deepep_num_max_dispatch_tokens_per_rank() -> int:
+    """返回覆盖启动 warmup 和运行期阶段的单 rank DeepEP buffer 容量。"""
+    # 启动 warmup 和运行期可能分别执行 prefill/decode；构造阶段统一覆盖
+    # 两种阶段，避免依赖模型内部 CUDA Graph 的具体捕获策略。
+    return max(
+        get_deepep_num_max_dispatch_tokens_per_rank_prefill(),
+        get_deepep_num_max_dispatch_tokens_per_rank_decode(),
+    )
+
+
+@lru_cache(maxsize=None)
+def get_lightllm_websocket_max_message_size():
+    """
+    Get the maximum size of the WebSocket message.
+    :return: Maximum size in bytes.
+    """
+    return int(os.getenv("LIGHTLLM_WEBSOCKET_MAX_SIZE", 256 * 1024 * 1024))
+
+
+# get_redundancy_expert_ids and get_redundancy_expert_num are primarily
+# used to obtain the IDs and number of redundant experts during inference.
+# They depend on a configuration file specified by ep_redundancy_expert_config_path,
+# which is a JSON formatted text file.
+# The content format is as follows:
+# {
+#   "redundancy_expert_num": 1,  # Number of redundant experts per rank
+#   "0": [0],                    # Key: layer_index (string),
+#                                # Value: list of original expert IDs that are redundant for this layer
+#   "1": [0],
+#   "default": [0]               # Default list of redundant expert IDs if layer-specific entry is not found
+# }
+
+
+@lru_cache(maxsize=None)
+def get_redundancy_expert_ids(layer_index: int):
+    """
+    Get the redundancy expert ids from the environment variable.
+    :return: List of redundancy expert ids.
+    """
+    args = get_env_start_args()
+    if args.ep_redundancy_expert_config_path is None:
+        return []
+
+    with open(args.ep_redundancy_expert_config_path, "r") as f:
+        config = json.load(f)
+    if str(layer_index) in config:
+        return config[str(layer_index)]
+    else:
+        return config.get("default", [])
+
+
+@lru_cache(maxsize=None)
+def get_redundancy_expert_num():
+    """
+    Get the number of redundancy experts from the environment variable.
+    :return: Number of redundancy experts.
+    """
+    args = get_env_start_args()
+    if args.ep_redundancy_expert_config_path is None:
+        return 0
+
+    with open(args.ep_redundancy_expert_config_path, "r") as f:
+        config = json.load(f)
+    if "redundancy_expert_num" in config:
+        return config["redundancy_expert_num"]
+    else:
+        return 0
+
+
+@lru_cache(maxsize=None)
+def get_redundancy_expert_update_interval():
+    return int(os.getenv("LIGHTLLM_REDUNDANCY_EXPERT_UPDATE_INTERVAL", 30 * 60))
+
+
+@lru_cache(maxsize=None)
+def get_redundancy_expert_update_max_load_count():
+    return int(os.getenv("LIGHTLLM_REDUNDANCY_EXPERT_UPDATE_MAX_LOAD_COUNT", 1))
+
+
+@lru_cache(maxsize=None)
+def get_triton_autotune_level():
+    return int(os.getenv("LIGHTLLM_TRITON_AUTOTUNE_LEVEL", 0))
+
+
+@lru_cache(maxsize=None)
+def get_decode_attn_autotune_seq_len() -> int:
+    """Decode attention 调优的代表性 KV 长度（token），默认 32768；调优时的 run key 按该长度分桶。"""
+    seq_len = int(os.getenv("LIGHTLLM_DECODE_ATTN_AUTOTUNE_SEQ_LEN", "32768"))
+    if seq_len <= 0:
+        raise ValueError("LIGHTLLM_DECODE_ATTN_AUTOTUNE_SEQ_LEN must be positive")
+    return seq_len
+
+
+g_model_init_done = False
+
+
+def get_model_init_status():
+    global g_model_init_done
+    return g_model_init_done
+
+
+def set_model_init_status(status: bool):
+    global g_model_init_done
+    g_model_init_done = status
+    return g_model_init_done
+
+
+def use_whisper_sdpa_attention() -> bool:
+    """
+    whisper重训后,使用特定的实现可以提升精度，用该函数控制使用的att实现。
+    """
+    return enable_env_vars("LIGHTLLM_USE_WHISPER_SDPA_ATTENTION")
+
+
+@lru_cache(maxsize=None)
+def enable_radix_tree_timer_merge() -> bool:
+    """
+    使能定期合并 radix tree的叶节点, 防止插入查询性能下降。
+    """
+    return enable_env_vars("LIGHTLLM_RADIX_TREE_MERGE_ENABLE")
+
+
+@lru_cache(maxsize=None)
+def get_radix_tree_merge_update_delta() -> int:
+    return int(os.getenv("LIGHTLLM_RADIX_TREE_MERGE_DELTA", 6000))
+
+
+@lru_cache(maxsize=None)
+def get_diverse_max_batch_shared_group_size() -> int:
+    return int(os.getenv("LIGHTLLM_MAX_BATCH_SHARED_GROUP_SIZE", 4))
+
+
+@lru_cache(maxsize=None)
+def enable_diverse_mode_gqa_decode_fast_kernel() -> bool:
+    return get_env_start_args().diverse_mode and "int8kv" == get_env_start_args().llm_kv_type
+
+
+@lru_cache(maxsize=None)
+def enable_triton_mtp_kernel() -> bool:
+    """
+    启用 Triton MTP 解码专用 kernel
+    通过启动参数 --mtp_step > 0 和 --llm_decode_att_backend=triton 控制
+    """
+    return (get_env_start_args().mtp_step > 0) and ("triton" in get_env_start_args().llm_decode_att_backend)
+
+
+@lru_cache(maxsize=None)
+def get_disk_cache_prompt_limit_length():
+    return int(os.getenv("LIGHTLLM_DISK_CACHE_PROMPT_LIMIT_LENGTH", 2048))
+
+
+def get_cache_placement_gpu_capacity_ratio() -> float:
+    ratio = float(os.getenv("LIGHTLLM_CACHE_PLACEMENT_GPU_CAPACITY_RATIO", 0.8))
+    assert 0 < ratio <= 1
+    return ratio
+
+
+@lru_cache(maxsize=None)
+def enable_huge_page():
+    """
+    大页模式：启动后可大幅缩短cpu kv cache加载时间
+    "sudo sed -i 's/^GRUB_CMDLINE_LINUX=\"/& default_hugepagesz=1G \
+        hugepagesz=1G hugepages={需要启用的大页容量}/' /etc/default/grub"
+    "sudo update-grub"
+    "sudo reboot"
+    """
+    return enable_env_vars("LIGHTLLM_HUGE_PAGE_ENABLE")
+
+
+@lru_cache(maxsize=None)
+def enable_cpu_cache_numa_interleave() -> bool:
+    """是否启用 CPU KV cache 共享内存的 NUMA 交错分配策略。"""
+    return enable_env_vars("LIGHTLLM_ENABLE_NUMA_INTERLEAVE")
+
+
+@lru_cache(maxsize=None)
+def get_added_mtp_kv_layer_num() -> int:
+    args = get_env_start_args()
+    mtp_mode = args.mtp_mode
+
+    if mtp_mode is None:
+        return 0
+    if mtp_mode == "vanilla_no_att":
+        return 0
+    if mtp_mode == "eagle_no_att":
+        return 0
+    if mtp_mode == "vanilla_with_att":
+        return args.mtp_step
+    if mtp_mode == "eagle_with_att":
+        return 1
+    if mtp_mode == "eagle3":
+        return _get_mtp_draft_backbone_layer_num(args.mtp_draft_model_dir[0])
+    if mtp_mode == "dspark":
+        return _get_mtp_draft_backbone_layer_num(args.mtp_draft_model_dir[0])
+    if mtp_mode == "dflash":
+        return _get_mtp_draft_backbone_layer_num(args.mtp_draft_model_dir[0])
+    if mtp_mode == "dflash2":
+        return _get_mtp_draft_backbone_layer_num(args.mtp_draft_model_dir[0])
+
+    raise ValueError(f"unsupported mtp_mode: {mtp_mode}")
+
+
+@lru_cache(maxsize=None)
+def get_mtp_weight_layer_num() -> int:
+    args = get_env_start_args()
+    mtp_mode = args.mtp_mode
+
+    if mtp_mode is None:
+        return 0
+    if mtp_mode == "vanilla_no_att":
+        return args.mtp_step
+    if mtp_mode == "eagle_no_att":
+        return 1
+    return get_added_mtp_kv_layer_num()
+
+
+def _get_mtp_draft_backbone_layer_num(draft_model_dir: str) -> int:
+    with open(os.path.join(draft_model_dir, "config.json"), "r") as json_file:
+        draft_config = json.load(json_file)
+
+    if draft_config.get("model_type") == "deepseek_v4":
+        return len(draft_config["dspark_target_layer_ids"])
+
+    # Use the effective draft backbone config when the checkpoint stores it nested.
+    draft_config.update(draft_config.get("dflash_config", {}))
+    # A draft model may contain multiple attention layers; each layer needs a
+    # separate KV-cache slot after the target model's layers.
+    layer_num = draft_config.get("num_hidden_layers", draft_config.get("n_layer"))
+    assert layer_num is not None, f"missing num_hidden_layers or n_layer in draft config: {draft_model_dir}"
+    return int(layer_num)
+
+
+@lru_cache(maxsize=None)
+def get_pd_node_resource_wait_timeout_seconds() -> int:
+    """P/D 节点的资源等待超时，单位为秒；负数表示永久等待。"""
+    return int(os.getenv("LIGHTLLM_PD_NODE_RESOURCE_WAIT_TIMEOUT_SECONDS", 20))
+
+
+@lru_cache(maxsize=None)
+def get_pd_node_continuation_resource_wait_timeout_seconds() -> int:
+    """P/D 节点处理续跑分段时的资源等待超时，单位为秒。"""
+    return max(0, int(os.getenv("LIGHTLLM_PD_NODE_CONTINUATION_RESOURCE_WAIT_TIMEOUT_SECONDS", 60)))
+
+
+@lru_cache(maxsize=None)
+def get_pd_node_busy_retry_timeout_seconds() -> int:
+    """PD Master 收到节点繁忙错误后的最长重试时间，单位为秒；0 表示不重试。"""
+    return max(0, int(os.getenv("LIGHTLLM_PD_NODE_BUSY_RETRY_TIMEOUT_SECONDS", 0)))
+
+
+@lru_cache(maxsize=None)
+def get_pd_cache_high_priority_max_age_seconds() -> int:
+    """cache 命中请求提升为 PD 高优先级时允许的最大缓存年龄，单位为秒。"""
+    return max(0, int(os.getenv("LIGHTLLM_PD_CACHE_HIGH_PRIORITY_MAX_AGE_SECONDS", 180)))
+
+
+@lru_cache(maxsize=None)
+def get_pd_cache_high_priority_min_prompt_tokens() -> int:
+    """cache 命中请求提升为 PD 高优先级时要求的最小 prompt token 数。"""
+    return max(0, int(os.getenv("LIGHTLLM_PD_CACHE_HIGH_PRIORITY_MIN_PROMPT_TOKENS", 2048)))
+
+
+@lru_cache(maxsize=None)
+def get_pd_long_prefix_affinity_max_age_seconds() -> int:
+    """长前缀可以越过空闲节点时，前缀记录允许的最大年龄，单位为秒。"""
+    return max(0, int(os.getenv("LIGHTLLM_PD_LONG_PREFIX_AFFINITY_MAX_AGE_SECONDS", 180)))
+
+
+@lru_cache(maxsize=None)
+def get_lightllm_url_pool_maxsize() -> int:
+    return int(os.getenv("LIGHTLLM_URL_POOL_MAXSIZE", 512))

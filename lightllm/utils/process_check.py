@@ -1,0 +1,66 @@
+import os
+import multiprocessing as mp
+import time
+import threading
+import psutil
+import signal
+from typing import Optional
+from lightllm.utils.log_utils import init_logger
+
+logger = init_logger(__name__)
+
+
+def install_fatal_thread_excepthook():
+    """Terminate the process when an unexpected daemon-thread exception escapes."""
+
+    def exit_process(args):
+        try:
+            logger.error(
+                f"fatal background thread failure in {getattr(args.thread, 'name', 'unknown')}",
+                exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+            )
+        finally:
+            os._exit(1)
+
+    threading.excepthook = exit_process
+
+
+def is_process_active(pid):
+    try:
+        process = psutil.Process(pid)
+        return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return False
+
+
+def kill_child_processes(parent_pid):
+    parent = psutil.Process(parent_pid)
+    for child in parent.children(recursive=True):
+        try:
+            os.kill(child.pid, signal.SIGKILL)
+            logger.warning(f"kill pid {child.pid}")
+        except BaseException as e:
+            logger.warning(f"kill pid {child.pid} failed {str(e)}")
+
+
+def check_parent_alive(parent_pid: Optional[int] = None):
+    # A late-starting worker may already have been reparented after its parent exited.
+    if parent_pid is None:
+        parent = mp.parent_process()
+        parent_pid = parent.pid if parent is not None else os.getppid()
+    while True:
+        if not is_process_active(parent_pid):
+            logger.warning(f"parent is dead, kill self {os.getpid()}")
+            kill_child_processes(os.getpid())
+            os.kill(os.getpid(), signal.SIGKILL)
+
+        time.sleep(10)
+    return
+
+
+def start_parent_check_thread(parent_pid: Optional[int] = None):
+    """
+    检测父进程是否健康，如果出现问题，清理退出所有进程
+    """
+    thread = threading.Thread(target=check_parent_alive, kwargs={"parent_pid": parent_pid}, daemon=True)
+    thread.start()
